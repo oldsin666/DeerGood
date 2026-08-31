@@ -1,5 +1,5 @@
-// 单文件版：OLED 显示「鸿蒙先锋号」 + SHT20 温湿度（多线程 + 信号量）
-// 已合并原 hal_bsp_ssd1306.c / fonts.h / I2c_Ssd1306.c 全部内容，仅此一个 .c
+// 单文件版：OLED 显示「鸿蒙先锋号」 + SHT20 温湿度 + AP3216C 光/接近（多线程 + 信号量）
+// 已合并原 hal_bsp_ssd1306.c / hal_bsp_sht20.c / hal_bsp_ap3216c.c / fonts.h / I2c_Ssd1306.c 全部内容，仅此一个 .c
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -14,6 +14,8 @@
 #include "wifiiot_gpio_ex.h"
 #include "wifiiot_i2c.h"
 #include "wifiiot_i2c_ex.h"
+#include "wifiiot_uart.h"
+#include "hi_time.h"
 
 // ===================== 字模 =====================
 static const unsigned char F6x8[][6] =
@@ -222,7 +224,7 @@ static const unsigned char F16X16_CHN[][32] = {
 #define SSD1306_I2C_ADDR (0x78)
 #define SSD1306_I2C_IDX  0
 
-static osMutexId_t g_i2cMutex = NULL;  // 保护 I2C0：避免 OLED 写与 SHT20 读写在多线程下并发冲突
+static osMutexId_t g_i2cMutex = NULL;  // 保护 I2C0：避免 OLED 写与传感器读写多线程并发冲突
 
 static uint32_t SSD1306_SendData(uint8_t *data, size_t size)
 {
@@ -424,14 +426,297 @@ uint32_t SHT20_Init(void)
     return 0;
 }
 
+// ===================== AP3216C 环境光/接近传感器 =====================
+// 老师图里标 0x1E（7 位），本代码库 HAL 收 8 位地址 → 0x1E << 1 = 0x3C
+#define AP3216C_I2C_ADDR (0x3C)
+#define AP3216C_I2C_IDX  0
+
+#define AP3216C_SYSTEM_ADDR 0x00
+#define AP3216C_IR_L_ADDR   0x0A
+#define AP3216C_IR_H_ADDR   0x0B
+#define AP3216C_ALS_L_ADDR  0x0C
+#define AP3216C_ALS_H_ADDR  0x0D
+#define AP3216C_PS_L_ADDR   0x0E
+#define AP3216C_PS_H_ADDR   0x0F
+
+static uint32_t AP3216C_WriteByteData(uint8_t byte)
+{
+    WifiIotI2cData i2cData = {0};
+    i2cData.sendBuf = &byte;
+    i2cData.sendLen = 1;
+    return I2cWrite(AP3216C_I2C_IDX, AP3216C_I2C_ADDR, &i2cData);
+}
+
+static uint32_t AP3216C_RecvData(uint8_t *data, size_t size)
+{
+    WifiIotI2cData i2cData = {0};
+    i2cData.receiveBuf = data;
+    i2cData.receiveLen = size;
+    return I2cRead(AP3216C_I2C_IDX, AP3216C_I2C_ADDR, &i2cData);
+}
+
+static uint32_t AP3216C_WriteCmdByteData(uint8_t regAddr, uint8_t byte)
+{
+    uint8_t buffer[] = {regAddr, byte};
+    WifiIotI2cData i2cData = {0};
+    i2cData.sendBuf = buffer;
+    i2cData.sendLen = 2;
+    return I2cWrite(AP3216C_I2C_IDX, AP3216C_I2C_ADDR, &i2cData);
+}
+
+static uint32_t AP3216C_ReadRegByteData(uint8_t regAddr, uint8_t *byte)
+{
+    uint32_t result;
+    uint8_t buffer[2] = {0};
+
+    result = AP3216C_WriteByteData(regAddr);
+    if (result != 0) return result;
+
+    result = AP3216C_RecvData(buffer, 1);
+    if (result != 0) return result;
+
+    *byte = buffer[0];
+    return 0;
+}
+
+uint32_t AP3216C_ReadData(uint16_t *irData, uint16_t *alsData, uint16_t *psData)
+{
+    uint32_t result;
+    uint8_t data_H = 0, data_L = 0;
+
+    if (g_i2cMutex) osMutexAcquire(g_i2cMutex, osWaitForever);
+
+    // IR 10-bit
+    result = AP3216C_ReadRegByteData(AP3216C_IR_L_ADDR, &data_L);
+    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    result = AP3216C_ReadRegByteData(AP3216C_IR_H_ADDR, &data_H);
+    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    if (data_L & 0x80) *irData = 0;
+    else *irData = ((uint16_t)data_H << 2) | (data_L & 0x03);
+
+    // ALS 16-bit
+    result = AP3216C_ReadRegByteData(AP3216C_ALS_L_ADDR, &data_L);
+    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    result = AP3216C_ReadRegByteData(AP3216C_ALS_H_ADDR, &data_H);
+    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    *alsData = ((uint16_t)data_H << 8) | data_L;
+
+    // PS 10-bit
+    result = AP3216C_ReadRegByteData(AP3216C_PS_L_ADDR, &data_L);
+    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    result = AP3216C_ReadRegByteData(AP3216C_PS_H_ADDR, &data_H);
+    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    if (data_L & 0x40) *psData = 0;
+    else *psData = ((uint16_t)(data_H & 0x3F) << 4) | (data_L & 0x0F);
+
+    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
+    return 0;
+}
+
+// I2C0 已由 SSD1306_Init() 初始化，这里只发复位+模式命令
+uint32_t AP3216C_Init(void)
+{
+    uint32_t result;
+
+    if (g_i2cMutex) osMutexAcquire(g_i2cMutex, osWaitForever);
+    result = AP3216C_WriteCmdByteData(AP3216C_SYSTEM_ADDR, 0x04);  // 复位
+    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
+
+    usleep(5000);
+
+    if (g_i2cMutex) osMutexAcquire(g_i2cMutex, osWaitForever);
+    result = AP3216C_WriteCmdByteData(AP3216C_SYSTEM_ADDR, 0x03);  // 开启 ALS + PS + IR
+    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
+    if (result != 0) return result;
+
+    return 0;
+}
+
+// ===================== UART1 蓝牙（BLE / JDY-16） =====================
+// 硬件：IO00=UART1_TXD, IO01=UART1_RXD（老师图里的 BLE-TX / BLE-RX）
+// 注意1：系统启动已把 UART1 初始化为 115200，这里绝不能再 UartInit（否则蓝牙失联、手机搜不到）
+// 注意2：printf 走调试串口，与蓝牙 UART1 是两路，手机要收到数据必须主动 UartWrite（不是靠 printf 透传）
+#define BLE_UART_IDX  WIFI_IOT_UART_IDX_1
+
+static void BLE_UartInit(void)
+{
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_0, WIFI_IOT_IO_FUNC_GPIO_0_UART1_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_1, WIFI_IOT_IO_FUNC_GPIO_1_UART1_RXD);
+    // 【关键】系统启动时已把 UART1 初始化为 115200(调试串口)，这里绝不能再次 UartInit，
+    // 否则会重设 UART1 的引脚复用，导致 GPIO0/GPIO1 蓝牙失联、手机搜不到设备。
+    // 老师工程 Peripheral.c 里同样把 UartInit(UART1) 注释掉了，只保留 IoSetFunc。
+    printf("BLE UART1 ready (复用系统初始化 115200)\r\n");
+}
+
+// ===================== WS2812 内置 LED（IO06，车前后各 6 颗共 12 颗） =====================
+#define WS_PIN      WIFI_IOT_IO_NAME_GPIO_6
+#define WS_COUNT    12
+
+// 时序 nop 参数（按 Hi3861 主频估算：1 次循环 ≈ 25ns）
+// 若灯不亮或颜色明显偏色，把这 4 个值按同比例微调即可
+#define WS_NOP_T0H  14   // 0码高电平 ~350ns
+#define WS_NOP_T0L  32   // 0码低电平 ~800ns
+#define WS_NOP_T1H  28   // 1码高电平 ~700ns
+#define WS_NOP_T1L  24   // 1码低电平 ~600ns
+
+static void ws_nops(unsigned int n)
+{
+    while (n--) {
+        __asm__ volatile("nop");
+    }
+}
+
+static void ws_send_byte(uint8_t b)
+{
+    for (int i = 7; i >= 0; i--) {
+        if (b & (1u << i)) {
+            GpioSetOutputVal(WS_PIN, WIFI_IOT_GPIO_VALUE1);
+            ws_nops(WS_NOP_T1H);
+            GpioSetOutputVal(WS_PIN, WIFI_IOT_GPIO_VALUE0);
+            ws_nops(WS_NOP_T1L);
+        } else {
+            GpioSetOutputVal(WS_PIN, WIFI_IOT_GPIO_VALUE1);
+            ws_nops(WS_NOP_T0H);
+            GpioSetOutputVal(WS_PIN, WIFI_IOT_GPIO_VALUE0);
+            ws_nops(WS_NOP_T0L);
+        }
+    }
+}
+
+// 注意：WS2812 的数据顺序是 GRB，不是 RGB
+static void WS2812_SetAll(uint8_t r, uint8_t g, uint8_t b)
+{
+    osKernelLock();  // 锁调度，保证整串数据时序不被任务切换打断
+    for (int i = 0; i < WS_COUNT; i++) {
+        ws_send_byte(g);
+        ws_send_byte(r);
+        ws_send_byte(b);
+    }
+    osKernelUnlock();
+    GpioSetOutputVal(WS_PIN, WIFI_IOT_GPIO_VALUE0);
+    hi_udelay(60);   // 复位信号：低电平保持 > 50us
+}
+
+static void WS2812_Init(void)
+{
+    IoSetFunc(WS_PIN, WIFI_IOT_IO_FUNC_GPIO_6_GPIO);
+    GpioSetDir(WS_PIN, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(WS_PIN, WIFI_IOT_GPIO_VALUE0);
+    WS2812_SetAll(0, 0, 0);
+}
+
+// ===================== HC-SR04 超声波（IO07=TRIG, IO08=ECHO） =====================
+#define HC_TRIG  WIFI_IOT_IO_NAME_GPIO_7
+#define HC_ECHO  WIFI_IOT_IO_NAME_GPIO_8
+
+static void HCSR04_Init(void)
+{
+    IoSetFunc(HC_TRIG, WIFI_IOT_IO_FUNC_GPIO_7_GPIO);
+    GpioSetDir(HC_TRIG, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(HC_TRIG, WIFI_IOT_GPIO_VALUE0);
+
+    IoSetFunc(HC_ECHO, WIFI_IOT_IO_FUNC_GPIO_8_GPIO);
+    GpioSetDir(HC_ECHO, WIFI_IOT_GPIO_DIR_IN);
+}
+
+// 返回距离(cm)；返回 <0 表示超时 / 没测到
+// 与原版驱动的区别：加了超时保护，模块没接或故障时不会 while(1) 卡死整个线程
+static float HCSR04_GetDistance(void)
+{
+    WifiIotGpioValue v = WIFI_IOT_GPIO_VALUE0;
+    unsigned long long t0 = 0, t1 = 0, due;
+
+    // TRIG 发一个 >=10us 的高脉冲
+    GpioSetOutputVal(HC_TRIG, WIFI_IOT_GPIO_VALUE1);
+    hi_udelay(20);
+    GpioSetOutputVal(HC_TRIG, WIFI_IOT_GPIO_VALUE0);
+
+    // 等 ECHO 变高（最多等 100ms）
+    due = hi_get_us() + 100000;
+    while (hi_get_us() < due) {
+        GpioGetInputVal(HC_ECHO, &v);
+        if (v == WIFI_IOT_GPIO_VALUE1) { t0 = hi_get_us(); break; }
+    }
+    if (t0 == 0) return -1.0f;
+
+    // 等 ECHO 变低，得到高电平持续时间
+    due = hi_get_us() + 100000;
+    while (hi_get_us() < due) {
+        GpioGetInputVal(HC_ECHO, &v);
+        if (v == WIFI_IOT_GPIO_VALUE0) { t1 = hi_get_us(); break; }
+    }
+    if (t1 == 0) return -1.0f;
+
+    // 距离 = 高电平时间(us) * 0.034 / 2
+    return (float)((double)(t1 - t0) * 0.034 / 2.0);
+}
+
+// ===================== TCRT5000 红外巡线（IO13=左, IO14=右） =====================
+// 原理：TCRT 模块输出低电平时表示识别到黑线，高电平时表示在白面上
+#define TC_L  WIFI_IOT_IO_NAME_GPIO_13
+#define TC_R  WIFI_IOT_IO_NAME_GPIO_14
+
+static void TCRT_Init(void)
+{
+    IoSetFunc(TC_L, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+    GpioSetDir(TC_L, WIFI_IOT_GPIO_DIR_IN);
+    IoSetFunc(TC_R, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+    GpioSetDir(TC_R, WIFI_IOT_GPIO_DIR_IN);
+}
+
+static void TCRT_Read(uint8_t *leftBlack, uint8_t *rightBlack)
+{
+    WifiIotGpioValue vL = WIFI_IOT_GPIO_VALUE1;
+    WifiIotGpioValue vR = WIFI_IOT_GPIO_VALUE1;
+    *leftBlack = (GpioGetInputVal(TC_L, &vL) == 0 && vL == WIFI_IOT_GPIO_VALUE0) ? 1 : 0;
+    *rightBlack = (GpioGetInputVal(TC_R, &vR) == 0 && vR == WIFI_IOT_GPIO_VALUE0) ? 1 : 0;
+}
+
+// ===================== 内置 LED 联动逻辑 =====================
+#define DIST_NEAR_CM   20    // 距离小于 20cm 视为"靠近"
+#define ALS_DARK_LUX   100   // 光照小于 100 视为"太暗"
+
+// 0=灭 1=靠近(红) 2=太暗(白)；只在状态变化时才刷灯，避免频繁占用 CPU
+static void Led_Update(float dist, uint16_t als, int alsValid, int *lastState)
+{
+    int want;
+    if (dist >= 0.0f && dist < DIST_NEAR_CM) {
+        want = 1;                 // 靠近：红色警示（优先级最高）
+    } else if (alsValid && als < ALS_DARK_LUX) {
+        want = 2;                 // 太暗：白色照明（仅当光感有效才判断）
+    } else {
+        want = 0;                 // 正常：灭
+    }
+
+    if (want != *lastState) {
+        *lastState = want;
+        if (want == 1) {
+            WS2812_SetAll(255, 0, 0);
+        } else if (want == 2) {
+            WS2812_SetAll(255, 255, 255);
+        } else {
+            WS2812_SetAll(0, 0, 0);
+        }
+    }
+}
+
 // ===================== 多线程 + 信号量（复刻老师架构） =====================
 static float g_temp = 0;
 static float g_humi = 0;
+static uint16_t g_ir = 0;
+static uint16_t g_als = 0;
+static int g_alsValid = 0;   // AP3216C 是否读到有效光照数据
+static uint16_t g_ps = 0;
+static float g_distance = -1.0f;   // 超声波距离(cm)，<0 表示没测到
+static int g_ledState = -1;        // 内置 LED 当前状态（见 Led_Update）
+static uint8_t g_leftBlack = 0;    // 1=左巡线传感器识别到黑线（IO13，低电平有效）
+static uint8_t g_rightBlack = 0;   // 1=右巡线传感器识别到黑线（IO14，低电平有效）
 static osSemaphoreId_t g_semRead = NULL;
 static osSemaphoreId_t g_semDisp = NULL;
 
 // thread1：周期释放两个信号量（生产者）
-static void SHT20_ProducerThread(void *arg)
+static void Sensor_ProducerThread(void *arg)
 {
     (void)arg;
     while (1) {
@@ -441,57 +726,147 @@ static void SHT20_ProducerThread(void *arg)
     }
 }
 
-// thread2：读 SHT20 温湿度 -> 串口打印
+// thread2：读 SHT20 + AP3216C -> 串口打印
 // 【门槛破解3】Hi3861 的 printf 默认不支持 %f，改用整数放大 ×100 拼两位小数
-static void SHT20_ReaderThread(void *arg)
+static void Sensor_ReaderThread(void *arg)
 {
     (void)arg;
     while (1) {
         osSemaphoreAcquire(g_semRead, osWaitForever);
+
         float temp = 0, humi = 0;
+        uint16_t ir = 0, als = 0, ps = 0;
+
         if (SHT20_ReadData(&temp, &humi) == 0) {
             g_temp = temp;
             g_humi = humi;
-            int ti = (int)(temp * 100.0f + (temp >= 0 ? 0.5f : -0.5f));
-            int hi = (int)(humi * 100.0f + (humi >= 0 ? 0.5f : -0.5f));
-            int ta = (ti < 0) ? -ti : ti;  // 负数时取绝对值, 符号单独拼, 避免 %02d 把负号带进小数部分
-            printf("temperature = %s%d.%02d C, humidity = %d.%02d %%\r\n",
-                   (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100);
         } else {
             printf("SHT20 read fail\r\n");
+        }
+
+        if (AP3216C_ReadData(&ir, &als, &ps) == 0) {
+            g_ir = ir;
+            g_als = als;
+            g_ps = ps;
+            g_alsValid = 1;   // 只有真正读到数据才认为光照值有效
+        } else {
+            g_alsValid = 0;
+            printf("AP3216C read fail\r\n");
+        }
+
+        // 超声波测距（GPIO 操作，不占 I2C 总线，无需加互斥锁）
+        float dist = HCSR04_GetDistance();
+        g_distance = dist;
+
+        // 红外巡线（IO13/IO14 输入，低电平=黑线）
+        TCRT_Read(&g_leftBlack, &g_rightBlack);
+
+        int ti = (int)(temp * 100.0f + (temp >= 0 ? 0.5f : -0.5f));
+        int hi = (int)(humi * 100.0f + (humi >= 0 ? 0.5f : -0.5f));
+        int ta = (ti < 0) ? -ti : ti;  // 负数时取绝对值, 符号单独拼
+        printf("T=%s%d.%02dC H=%d.%02d%% L=%u P=%u I=%u D=%dcm TCRT=%s%s\r\n",
+               (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100,
+               als, ps, ir, (int)(dist < 0 ? -1 : dist),
+               g_leftBlack ? "L" : "-", g_rightBlack ? "R" : "-");
+
+        // 主动把同一份数据推送给蓝牙（手机端）
+        // 注意：printf 走的是调试串口，蓝牙是独立的 UART1(IO00/01)，两者并不共用，
+        //       所以必须主动 UartWrite，手机 App 才能持续收到数据。
+        char bleLine[96];
+        int n = snprintf(bleLine, sizeof(bleLine),
+                         "T=%s%d.%02dC H=%d.%02d%% L=%u P=%u I=%u D=%dcm TCRT=%s%s\r\n",
+                         (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100,
+                         als, ps, ir, (int)(dist < 0 ? -1 : dist),
+                         g_leftBlack ? "L" : "-", g_rightBlack ? "R" : "-");
+        if (n > 0) {
+            UartWrite(BLE_UART_IDX, (unsigned char *)bleLine, (unsigned int)n);
         }
     }
 }
 
-// thread3：把最新温湿度刷新到 OLED（读与显示解耦）
-static void SHT20_DisplayThread(void *arg)
+// thread3：把最新数据刷新到 OLED（读与显示解耦）
+static void Sensor_DisplayThread(void *arg)
 {
     (void)arg;
-    char line[16];
-    char blank[16] = "                ";
+    char line[32];
+    char blank[33] = "                                ";  // 32空格 + NUL，避免 ShowStr 越界读
     while (1) {
         osSemaphoreAcquire(g_semDisp, osWaitForever);
+
         int ti = (int)(g_temp * 100.0f + (g_temp >= 0 ? 0.5f : -0.5f));
         int hi = (int)(g_humi * 100.0f + (g_humi >= 0 ? 0.5f : -0.5f));
-        int ta = (ti < 0) ? -ti : ti;  // 同 Reader, 负数取绝对值再拼符号
-        snprintf(line, sizeof(line), "T:%s%d.%02dC", (ti < 0) ? "-" : "", ta / 100, ta % 100);
+        int ta = (ti < 0) ? -ti : ti;
+
+        // 第 2 页：温湿度
+        snprintf(line, sizeof(line), "T:%s%d.%02dC H:%d.%02d%%",
+                 (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100);
         SSD1306_ShowStr(0, 2, (uint8_t *)blank, 8);
         SSD1306_ShowStr(0, 2, (uint8_t *)line, 8);
-        snprintf(line, sizeof(line), "H:%d.%02d%%", hi / 100, hi % 100);
+
+        // 第 3 页：光照 / 接近 / 红外
+        snprintf(line, sizeof(line), "L:%u P:%u I:%u", g_als, g_ps, g_ir);
         SSD1306_ShowStr(0, 3, (uint8_t *)blank, 8);
         SSD1306_ShowStr(0, 3, (uint8_t *)line, 8);
+
+        // 内置 LED 联动：靠近亮红 / 太暗亮白（状态变化时才刷灯）
+        Led_Update(g_distance, g_als, g_alsValid, &g_ledState);
     }
 }
 
-// 入口：初始化 OLED + 创建信号量与 3 个线程
+// thread4：蓝牙接收 —— 手机发来的数据回显，并支持 T/L 指令主动查询
+static void BLE_RecvThread(void *arg)
+{
+    (void)arg;
+    unsigned char buf[64];
+    char resp[64];
+
+    while (1) {
+        int len = UartRead(BLE_UART_IDX, buf, sizeof(buf) - 1);
+        if (len > 0) {
+            buf[len] = '\0';
+            UartWrite(BLE_UART_IDX, buf, (unsigned int)len);  // 原样回显给手机
+
+            // 'T' 查询温湿度、'L' 查询光感，其余原样回显
+            if (buf[0] == 'T' || buf[0] == 't') {
+                int ti = (int)(g_temp * 100.0f + (g_temp >= 0 ? 0.5f : -0.5f));
+                int hi = (int)(g_humi * 100.0f + (g_humi >= 0 ? 0.5f : -0.5f));
+                int ta = (ti < 0) ? -ti : ti;
+                int ha = (hi < 0) ? -hi : hi;
+                int n = snprintf(resp, sizeof(resp), "T=%s%d.%02dC H=%s%d.%02d%%\r\n",
+                                 (ti < 0) ? "-" : "", ta / 100, ta % 100,
+                                 (hi < 0) ? "-" : "", ha / 100, ha % 100);
+                if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
+            } else if (buf[0] == 'L' || buf[0] == 'l') {
+                int n = snprintf(resp, sizeof(resp), "L=%u P=%u I=%u\r\n", g_als, g_ps, g_ir);
+                if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
+            } else if (buf[0] == 'R' || buf[0] == 'r') {
+                int n = snprintf(resp, sizeof(resp), "TCRT=%s%s\r\n",
+                                 g_leftBlack ? "L" : "-", g_rightBlack ? "R" : "-");
+                if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
+            }
+        }
+        osDelay(20);  // 无数据时让出 CPU，避免忙等
+    }
+}
+
+// 入口：初始化 OLED + 传感器 + 创建信号量与 3 个线程
 static void I2c_Ssd1306_Demo(void)
 {
     g_i2cMutex = osMutexNew(NULL);
     SSD1306_Init();
     SSD1306_CLS();
+
     if (SHT20_Init() != 0) {
         printf("SHT20 init fail\r\n");
     }
+    if (AP3216C_Init() != 0) {
+        printf("AP3216C init fail\r\n");
+    }
+    WS2812_Init();   // 内置 WS2812 灯带（IO06）
+    HCSR04_Init();   // 超声波 HC-SR04（IO07=TRIG, IO08=ECHO）
+    TCRT_Init();     // 红外巡线（IO13=左，IO14=右）
+    BLE_UartInit();
+
     SSD1306_ShowChineseStr(24, 0, (uint8_t *)"鸿蒙先锋号", 5);
 
     g_semRead = osSemaphoreNew(1, 0, NULL);
@@ -502,11 +877,13 @@ static void I2c_Ssd1306_Demo(void)
     attr.priority = osPriorityNormal;
 
     attr.name = "thread1";
-    osThreadNew((osThreadFunc_t)SHT20_ProducerThread, NULL, &attr);
+    osThreadNew((osThreadFunc_t)Sensor_ProducerThread, NULL, &attr);
     attr.name = "thread2";
-    osThreadNew((osThreadFunc_t)SHT20_ReaderThread, NULL, &attr);
+    osThreadNew((osThreadFunc_t)Sensor_ReaderThread, NULL, &attr);
     attr.name = "thread3";
-    osThreadNew((osThreadFunc_t)SHT20_DisplayThread, NULL, &attr);
+    osThreadNew((osThreadFunc_t)Sensor_DisplayThread, NULL, &attr);
+    attr.name = "thread4";
+    osThreadNew((osThreadFunc_t)BLE_RecvThread, NULL, &attr);
 }
 
 APP_FEATURE_INIT(I2c_Ssd1306_Demo);
