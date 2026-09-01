@@ -534,19 +534,116 @@ uint32_t AP3216C_Init(void)
 }
 
 // ===================== UART1 蓝牙（BLE / JDY-16） =====================
-// 硬件：IO00=UART1_TXD, IO01=UART1_RXD（老师图里的 BLE-TX / BLE-RX）
-// 注意1：系统启动已把 UART1 初始化为 115200，这里绝不能再 UartInit（否则蓝牙失联、手机搜不到）
-// 注意2：printf 走调试串口，与蓝牙 UART1 是两路，手机要收到数据必须主动 UartWrite（不是靠 printf 透传）
+// 硬件：IO00=UART1_TXD, IO01=UART1_RXD（连 JDY-16 蓝牙模块）
+// 【关键根因】JDY-16 出厂默认波特率是 9600（AT+BAUD4），而系统启动把 UART1 初始化成 115200，
+//   两者不匹配 → Hi3861 按 115200 发、JDY-16 按 9600 收，全是乱码，手机自然收不到数据。
+//   所以必须重新 UartInit(UART1, 9600) 把波特率改成 9600，再固定引脚到 GPIO0/1。
+//   注：UartInit 只改波特率、不碰引脚（底层 hi_uart_init 不设置 IO 复用），所以这里顺序无妨，
+//   但为保险仍把 IoSetFunc 放在 UartInit 之后，确保 GPIO0/1 最终是 UART1。
 #define BLE_UART_IDX  WIFI_IOT_UART_IDX_1
+#define BLE_BAUDRATE  9600
 
 static void BLE_UartInit(void)
 {
+    WifiIotUartAttribute attr = {0};
+    attr.baudRate = BLE_BAUDRATE;
+    attr.dataBits = WIFI_IOT_UART_DATA_BIT_8;
+    attr.stopBits = WIFI_IOT_UART_STOP_BIT_1;
+    attr.parity   = WIFI_IOT_UART_PARITY_NONE;
+
+    if (UartInit(BLE_UART_IDX, &attr, NULL) != 0) {
+        printf("BLE UART1 init fail\r\n");
+    }
+
     IoSetFunc(WIFI_IOT_IO_NAME_GPIO_0, WIFI_IOT_IO_FUNC_GPIO_0_UART1_TXD);
     IoSetFunc(WIFI_IOT_IO_NAME_GPIO_1, WIFI_IOT_IO_FUNC_GPIO_1_UART1_RXD);
-    // 【关键】系统启动时已把 UART1 初始化为 115200(调试串口)，这里绝不能再次 UartInit，
-    // 否则会重设 UART1 的引脚复用，导致 GPIO0/GPIO1 蓝牙失联、手机搜不到设备。
-    // 老师工程 Peripheral.c 里同样把 UartInit(UART1) 注释掉了，只保留 IoSetFunc。
-    printf("BLE UART1 ready (复用系统初始化 115200)\r\n");
+
+    printf("BLE UART1 ready (baud=%d, JDY-16)\r\n", BLE_BAUDRATE);
+}
+
+// ===================== UART2 与 STM32 通信 + 双电机控制 =====================
+// 硬件：IO11=UART2_TXD, IO12=UART2_RXD（连 STM32）
+// 协议（6 字节）：0xFC | A_dir | A_speed | B_dir | B_speed | 0xFD
+//   dir  : 1=正转, 0=反转
+//   speed: 0~150（限幅，超过按 150 发）
+#define MOTOR_UART_IDX   WIFI_IOT_UART_IDX_2
+#define MOTOR_BAUDRATE   115200
+#define MOTOR_SPEED_MAX  150
+#define MOTOR_FRAME_HEAD 0xFC
+#define MOTOR_FRAME_TAIL 0xFD
+
+static int g_motorUartReady = 0;   // UART2 初始化成功标志
+
+// 与蓝牙 UART1 不同，UART2 系统没有初始化过，这里必须主动 UartInit
+static void Motor_UartInit(void)
+{
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_UART2_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_12, WIFI_IOT_IO_FUNC_GPIO_12_UART2_RXD);
+
+    WifiIotUartAttribute attr = {0};
+    attr.baudRate = MOTOR_BAUDRATE;
+    attr.dataBits = WIFI_IOT_UART_DATA_BIT_8;
+    attr.stopBits = WIFI_IOT_UART_STOP_BIT_1;
+    attr.parity   = WIFI_IOT_UART_PARITY_NONE;
+
+    if (UartInit(MOTOR_UART_IDX, &attr, NULL) != 0) {
+        g_motorUartReady = 0;
+        printf("Motor UART2 init fail\r\n");
+    } else {
+        g_motorUartReady = 1;
+        printf("Motor UART2 ready (115200)\r\n");
+    }
+}
+
+// 双电机控制：motorA=左轮速度, motorB=右轮速度，范围 -150 ~ +150
+// 协议方向位对齐老师 robot_l9110s.c：dir=0 正转，dir=1 反转（负速度 -> dir=1）
+static void stm32_motor_control(int motorA, int motorB)
+{
+    unsigned char buf[6];
+    unsigned char aDir = 0, bDir = 0;   // 0=正转, 1=反转
+
+    if (!g_motorUartReady) {
+        return;   // UART2 未就绪时不发，避免访问无效驱动导致异常
+    }
+
+    // 方向分离：负速度 -> 反转(dir=1)，并取绝对值
+    if (motorA < 0) { aDir = 1; motorA = -motorA; }
+    if (motorB < 0) { bDir = 1; motorB = -motorB; }
+
+    // 限幅，防止超出 STM32 侧协议范围
+    if (motorA > MOTOR_SPEED_MAX) motorA = MOTOR_SPEED_MAX;
+    if (motorB > MOTOR_SPEED_MAX) motorB = MOTOR_SPEED_MAX;
+
+    // 组帧：帧头 + 左轮(方向,速度) + 右轮(方向,速度) + 帧尾
+    buf[0] = MOTOR_FRAME_HEAD;
+    buf[1] = aDir;
+    buf[2] = (unsigned char)motorA;
+    buf[3] = bDir;
+    buf[4] = (unsigned char)motorB;
+    buf[5] = MOTOR_FRAME_TAIL;
+
+    UartWrite(MOTOR_UART_IDX, buf, sizeof(buf));
+}
+
+// 运动封装（对齐老师 robot_l9110s.c：正转=前进，反转=后退）
+// 若实测方向相反，把下面各函数的正负号整体取反即可（只改这一处）。
+#define CAR_DEFAULT_SPEED 60   // 默认油门（约 40%）
+
+static void car_forward(unsigned char speed)
+{
+    stm32_motor_control((int)speed, (int)speed);      // 两轮正转 = 前进
+}
+static void car_backward(unsigned char speed)
+{
+    stm32_motor_control(-(int)speed, -(int)speed);    // 两轮反转 = 后退
+}
+static void car_left(unsigned char speed)
+{
+    stm32_motor_control(-(int)speed, (int)speed);     // 左退右进 = 车头左转（自主巡航避障用）
+}
+static void car_stop(void)
+{
+    stm32_motor_control(0, 0);
 }
 
 // ===================== WS2812 内置 LED（IO06，车前后各 6 颗共 12 颗） =====================
@@ -652,8 +749,10 @@ static float HCSR04_GetDistance(void)
     return (float)((double)(t1 - t0) * 0.034 / 2.0);
 }
 
-// ===================== TCRT5000 红外巡线（IO13=左, IO14=右） =====================
-// 原理：TCRT 模块输出低电平时表示识别到黑线，高电平时表示在白面上
+// ===================== TCRT5000 车底检测（CGQ1=IO13, CGQ2=IO14） =====================
+// 原理图：CGQ1/CGQ2 是两个 TCRT5000 红外对管（车底），经 LM393 U22 比较器输出 TC_OUT_L/R -> IO13/IO14。
+// 极性（对齐老师 trace_model.c）：低电平=有反射(地面/白面)，高电平=无反射(黑线/悬空)。
+// 同一组传感器两种用途：巡线时高电平=压黑线；防掉落时高电平=车底悬空。
 #define TC_L  WIFI_IOT_IO_NAME_GPIO_13
 #define TC_R  WIFI_IOT_IO_NAME_GPIO_14
 
@@ -665,12 +764,53 @@ static void TCRT_Init(void)
     GpioSetDir(TC_R, WIFI_IOT_GPIO_DIR_IN);
 }
 
-static void TCRT_Read(uint8_t *leftBlack, uint8_t *rightBlack)
+// 读车底检测：1=检测到无反射(黑线/悬空)，0=有反射(地面正常)
+static void TCRT_Read(uint8_t *leftNoReflect, uint8_t *rightNoReflect)
 {
-    WifiIotGpioValue vL = WIFI_IOT_GPIO_VALUE1;
-    WifiIotGpioValue vR = WIFI_IOT_GPIO_VALUE1;
-    *leftBlack = (GpioGetInputVal(TC_L, &vL) == 0 && vL == WIFI_IOT_GPIO_VALUE0) ? 1 : 0;
-    *rightBlack = (GpioGetInputVal(TC_R, &vR) == 0 && vR == WIFI_IOT_GPIO_VALUE0) ? 1 : 0;
+    WifiIotGpioValue vL = WIFI_IOT_GPIO_VALUE0;
+    WifiIotGpioValue vR = WIFI_IOT_GPIO_VALUE0;
+    *leftNoReflect = (GpioGetInputVal(TC_L, &vL) == 0 && vL == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+    *rightNoReflect = (GpioGetInputVal(TC_R, &vR) == 0 && vR == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+}
+
+// ===================== 自主巡航：一直前进，遇边缘后退 + 左转 60 度 =====================
+// 蓝牙运动遥控已封存（见 BLE_HandleChar），小车由本线程自主驾驶。
+#define CLIFF_BACK_MS   300   // 检测到边缘后的后退时长(ms)，离开悬崖边
+#define TURN_60DEG_MS   300   // 左转 60 度的时长(ms) —— 需按实际车速标定：
+                              // 转不够就调大，转过头就调小（受电池电压/地面摩擦影响）
+
+static void AutoDriveThread(void *arg)
+{
+    (void)arg;
+    int lastCmd = -1;   // 0=已停 1=前进中；只在状态变化时下发，减少 UART2 通信量
+
+    osDelay(500);   // 上电后稍等，确保 STM32 已就绪，首帧前进指令不丢失
+    printf("AUTO DRIVE start: forward, on edge -> back + turn left 60deg\r\n");
+
+    while (1) {
+        uint8_t l = 0, r = 0;
+        TCRT_Read(&l, &r);
+
+        if (l || r) {
+            // 车底悬空（到边缘）：后退 -> 左转 60 度 -> 停
+            car_stop();
+            osDelay(50);
+            car_backward(CAR_DEFAULT_SPEED);
+            osDelay(CLIFF_BACK_MS);
+            car_left(CAR_DEFAULT_SPEED);      // 左轮退、右轮进 = 原地左转
+            osDelay(TURN_60DEG_MS);
+            car_stop();
+            lastCmd = 0;
+            printf("EDGE detected: back + turn left 60deg\r\n");
+            osDelay(300);   // 冷却，避免边缘抖动导致连续触发
+        } else if (lastCmd != 1) {
+            // 正常：持续前进（STM32 收到一帧即保持该速度，不必每周期重发）
+            car_forward(CAR_DEFAULT_SPEED);
+            lastCmd = 1;
+        }
+
+        osDelay(50);   // 50ms 检测周期（防掉落需高频，不能只靠 Reader 线程的 3s）
+    }
 }
 
 // ===================== 内置 LED 联动逻辑 =====================
@@ -710,10 +850,11 @@ static int g_alsValid = 0;   // AP3216C 是否读到有效光照数据
 static uint16_t g_ps = 0;
 static float g_distance = -1.0f;   // 超声波距离(cm)，<0 表示没测到
 static int g_ledState = -1;        // 内置 LED 当前状态（见 Led_Update）
-static uint8_t g_leftBlack = 0;    // 1=左巡线传感器识别到黑线（IO13，低电平有效）
-static uint8_t g_rightBlack = 0;   // 1=右巡线传感器识别到黑线（IO14，低电平有效）
+static uint8_t g_leftBlack = 0;    // 1=左车底检测识别到无反射/黑线（IO13，高电平有效）
+static uint8_t g_rightBlack = 0;   // 1=右车底检测识别到无反射/黑线（IO14，高电平有效）
 static osSemaphoreId_t g_semRead = NULL;
 static osSemaphoreId_t g_semDisp = NULL;
+static volatile int g_i2cReady = 0;   // I2C 设备(OLED/SHT20/AP3216C)初始化完成标志
 
 // thread1：周期释放两个信号量（生产者）
 static void Sensor_ProducerThread(void *arg)
@@ -737,21 +878,24 @@ static void Sensor_ReaderThread(void *arg)
         float temp = 0, humi = 0;
         uint16_t ir = 0, als = 0, ps = 0;
 
-        if (SHT20_ReadData(&temp, &humi) == 0) {
-            g_temp = temp;
-            g_humi = humi;
-        } else {
-            printf("SHT20 read fail\r\n");
-        }
+        // 仅当 I2C 设备初始化完成才读（避免 I2C 卡死拖垮整个线程）
+        if (g_i2cReady) {
+            if (SHT20_ReadData(&temp, &humi) == 0) {
+                g_temp = temp;
+                g_humi = humi;
+            } else {
+                printf("SHT20 read fail\r\n");
+            }
 
-        if (AP3216C_ReadData(&ir, &als, &ps) == 0) {
-            g_ir = ir;
-            g_als = als;
-            g_ps = ps;
-            g_alsValid = 1;   // 只有真正读到数据才认为光照值有效
-        } else {
-            g_alsValid = 0;
-            printf("AP3216C read fail\r\n");
+            if (AP3216C_ReadData(&ir, &als, &ps) == 0) {
+                g_ir = ir;
+                g_als = als;
+                g_ps = ps;
+                g_alsValid = 1;   // 只有真正读到数据才认为光照值有效
+            } else {
+                g_alsValid = 0;
+                printf("AP3216C read fail\r\n");
+            }
         }
 
         // 超声波测距（GPIO 操作，不占 I2C 总线，无需加互斥锁）
@@ -797,78 +941,157 @@ static void Sensor_DisplayThread(void *arg)
         int hi = (int)(g_humi * 100.0f + (g_humi >= 0 ? 0.5f : -0.5f));
         int ta = (ti < 0) ? -ti : ti;
 
-        // 第 2 页：温湿度
-        snprintf(line, sizeof(line), "T:%s%d.%02dC H:%d.%02d%%",
-                 (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100);
-        SSD1306_ShowStr(0, 2, (uint8_t *)blank, 8);
-        SSD1306_ShowStr(0, 2, (uint8_t *)line, 8);
+        // 仅当 I2C 就绪才刷 OLED（I2C 卡死时跳过显示，不影响其他功能）
+        if (g_i2cReady) {
+            // 第 2 页：温湿度
+            snprintf(line, sizeof(line), "T:%s%d.%02dC H:%d.%02d%%",
+                     (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100);
+            SSD1306_ShowStr(0, 2, (uint8_t *)blank, 8);
+            SSD1306_ShowStr(0, 2, (uint8_t *)line, 8);
 
-        // 第 3 页：光照 / 接近 / 红外
-        snprintf(line, sizeof(line), "L:%u P:%u I:%u", g_als, g_ps, g_ir);
-        SSD1306_ShowStr(0, 3, (uint8_t *)blank, 8);
-        SSD1306_ShowStr(0, 3, (uint8_t *)line, 8);
+            // 第 3 页：光照 / 接近 / 红外
+            snprintf(line, sizeof(line), "L:%u P:%u I:%u", g_als, g_ps, g_ir);
+            SSD1306_ShowStr(0, 3, (uint8_t *)blank, 8);
+            SSD1306_ShowStr(0, 3, (uint8_t *)line, 8);
+        }
 
         // 内置 LED 联动：靠近亮红 / 太暗亮白（状态变化时才刷灯）
         Led_Update(g_distance, g_als, g_alsValid, &g_ledState);
     }
 }
 
-// thread4：蓝牙接收 —— 手机发来的数据回显，并支持 T/L 指令主动查询
+// thread4：蓝牙接收（从零重写）—— 逐字节解析，避免粘包丢指令
+//   查询指令：T=温湿度, L=光感, R=巡线
+//   运动指令：W=前进, S=后退, A=左转, D=右转, X=停止（用 WASD+X，避开 T/L/R 不冲突）
+
+// 往蓝牙发一行字符串（自动带 \r\n 由调用方决定，这里只发原始字节）
+static void BLE_SendStr(const char *s)
+{
+    if (s != NULL) {
+        UartWrite(BLE_UART_IDX, (const unsigned char *)s, (unsigned int)strlen(s));
+    }
+}
+
+// 处理手机发来的一个字节指令（逐字节，粘包也不丢）
+static void BLE_HandleChar(unsigned char ch)
+{
+    char resp[64];
+    int n;
+
+    switch (ch) {
+        // ---- 查询指令 ----
+        case 'T':
+        case 't': {
+            int ti = (int)(g_temp * 100.0f + (g_temp >= 0 ? 0.5f : -0.5f));
+            int hi = (int)(g_humi * 100.0f + (g_humi >= 0 ? 0.5f : -0.5f));
+            int ta = (ti < 0) ? -ti : ti;
+            int ha = (hi < 0) ? -hi : hi;
+            n = snprintf(resp, sizeof(resp), "T=%s%d.%02dC H=%s%d.%02d%%\r\n",
+                         (ti < 0) ? "-" : "", ta / 100, ta % 100,
+                         (hi < 0) ? "-" : "", ha / 100, ha % 100);
+            if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
+            break;
+        }
+        case 'L':
+        case 'l':
+            n = snprintf(resp, sizeof(resp), "L=%u P=%u I=%u\r\n", g_als, g_ps, g_ir);
+            if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
+            break;
+        case 'R':
+        case 'r':
+            n = snprintf(resp, sizeof(resp), "TCRT=%s%s\r\n",
+                         g_leftBlack ? "L" : "-", g_rightBlack ? "R" : "-");
+            if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
+            break;
+
+        // ---- 运动指令：已封存 ----
+        // 当前为「自主巡航模式」，小车由 AutoDriveThread 自主驾驶（一直前进、遇边缘后退+左转60度）。
+        // 蓝牙只保留 T/L/R 数据查询，运动遥控不再生效，避免与自主逻辑抢 UART2。
+        case 'W':
+        case 'w':
+        case 'S':
+        case 's':
+        case 'A':
+        case 'a':
+        case 'D':
+        case 'd':
+        case 'X':
+        case 'x':
+        case ' ':
+            BLE_SendStr("(remote disabled: auto drive mode)\r\n");
+            break;
+
+        // ---- 忽略回车换行等无意义字节 ----
+        case '\r':
+        case '\n':
+        case 0:
+            break;
+
+        default:
+            break;   // 未知指令忽略（不回显，避免手机端刷屏）
+    }
+}
+
 static void BLE_RecvThread(void *arg)
 {
     (void)arg;
     unsigned char buf[64];
-    char resp[64];
 
     while (1) {
-        int len = UartRead(BLE_UART_IDX, buf, sizeof(buf) - 1);
+        int len = UartRead(BLE_UART_IDX, buf, sizeof(buf));
         if (len > 0) {
-            buf[len] = '\0';
-            UartWrite(BLE_UART_IDX, buf, (unsigned int)len);  // 原样回显给手机
-
-            // 'T' 查询温湿度、'L' 查询光感，其余原样回显
-            if (buf[0] == 'T' || buf[0] == 't') {
-                int ti = (int)(g_temp * 100.0f + (g_temp >= 0 ? 0.5f : -0.5f));
-                int hi = (int)(g_humi * 100.0f + (g_humi >= 0 ? 0.5f : -0.5f));
-                int ta = (ti < 0) ? -ti : ti;
-                int ha = (hi < 0) ? -hi : hi;
-                int n = snprintf(resp, sizeof(resp), "T=%s%d.%02dC H=%s%d.%02d%%\r\n",
-                                 (ti < 0) ? "-" : "", ta / 100, ta % 100,
-                                 (hi < 0) ? "-" : "", ha / 100, ha % 100);
-                if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
-            } else if (buf[0] == 'L' || buf[0] == 'l') {
-                int n = snprintf(resp, sizeof(resp), "L=%u P=%u I=%u\r\n", g_als, g_ps, g_ir);
-                if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
-            } else if (buf[0] == 'R' || buf[0] == 'r') {
-                int n = snprintf(resp, sizeof(resp), "TCRT=%s%s\r\n",
-                                 g_leftBlack ? "L" : "-", g_rightBlack ? "R" : "-");
-                if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
+            for (int i = 0; i < len; i++) {
+                BLE_HandleChar(buf[i]);   // 逐字节解析，粘包也不丢指令
             }
         }
-        osDelay(20);  // 无数据时让出 CPU，避免忙等
+        osDelay(10);   // 轮询间隙；若 UartRead 是阻塞式，此句仅作兜底
     }
 }
 
-// 入口：初始化 OLED + 传感器 + 创建信号量与 3 个线程
-static void I2c_Ssd1306_Demo(void)
+// thread5：I2C 设备初始化（独立线程）—— I2C 若卡死只卡本线程，不影响蓝牙/电机/其他
+static void I2c_InitThread(void *arg)
 {
-    g_i2cMutex = osMutexNew(NULL);
+    (void)arg;
+
     SSD1306_Init();
     SSD1306_CLS();
-
     if (SHT20_Init() != 0) {
         printf("SHT20 init fail\r\n");
     }
     if (AP3216C_Init() != 0) {
         printf("AP3216C init fail\r\n");
     }
-    WS2812_Init();   // 内置 WS2812 灯带（IO06）
-    HCSR04_Init();   // 超声波 HC-SR04（IO07=TRIG, IO08=ECHO）
-    TCRT_Init();     // 红外巡线（IO13=左，IO14=右）
-    BLE_UartInit();
-
     SSD1306_ShowChineseStr(24, 0, (uint8_t *)"鸿蒙先锋号", 5);
 
+    g_i2cReady = 1;   // 置位标志，Reader/Display 线程才真正开始读写 I2C
+    printf("=== I2C READY ===\r\n");
+
+    while (1) {
+        osDelay(1000);   // 初始化完成后挂起，不再做事
+    }
+}
+
+// 入口：只做不依赖 I2C 的初始化 + 创建所有线程；I2C 初始化交给独立线程（thread5）
+static void I2c_Ssd1306_Demo(void)
+{
+    printf("=== APP INIT START ===\r\n");
+
+    g_i2cMutex = osMutexNew(NULL);
+    printf("=== mutex done ===\r\n");
+
+    // ① 纯 GPIO 外设（不依赖 I2C）
+    WS2812_Init();   // 内置 WS2812 灯带（IO06）
+    HCSR04_Init();   // 超声波 HC-SR04（IO07=TRIG, IO08=ECHO）
+    TCRT_Init();     // 车底检测 CGQ1/CGQ2（IO13=左，IO14=右，自主巡航的边缘检测）
+    printf("=== GPIO init done ===\r\n");
+
+    // ② UART 外设
+    BLE_UartInit();      // UART1 蓝牙（IO00/01）
+    Motor_UartInit();    // UART2 与 STM32 通信（IO11=TXD, IO12=RXD）
+    car_stop();          // 上电先发一帧停止指令，避免 STM32 残留状态导致乱跑
+    printf("=== UART init done ===\r\n");
+
+    // ③ 创建信号量与全部线程
     g_semRead = osSemaphoreNew(1, 0, NULL);
     g_semDisp = osSemaphoreNew(1, 0, NULL);
 
@@ -884,6 +1107,12 @@ static void I2c_Ssd1306_Demo(void)
     osThreadNew((osThreadFunc_t)Sensor_DisplayThread, NULL, &attr);
     attr.name = "thread4";
     osThreadNew((osThreadFunc_t)BLE_RecvThread, NULL, &attr);
+    attr.name = "thread5";
+    osThreadNew((osThreadFunc_t)I2c_InitThread, NULL, &attr);   // I2C 初始化独立线程
+    attr.name = "thread6";
+    osThreadNew((osThreadFunc_t)AutoDriveThread, NULL, &attr);  // 自主巡航：一直前进 + 遇边缘后退左转60度
+
+    printf("=== ALL THREADS STARTED ===\r\n");
 }
 
 APP_FEATURE_INIT(I2c_Ssd1306_Demo);
