@@ -16,6 +16,19 @@
 #include "wifiiot_i2c_ex.h"
 #include "wifiiot_uart.h"
 #include "hi_time.h"
+#include "hi_uart.h"   // 波特率自适应需要 hi_uart_read_timeout（带超时读）
+
+/* ===== WiFi / MQTT 配置（烧录前改成自己的值）===== */
+#include "wifi_device.h"      // WifiConnect / GetStationIP（见 wifi_connect.c）
+#include "MQTTClient.h"       // paho MQTT 客户端（LiteOS 移植）
+
+#define WIFI_SSID         "BUAA-WIFI"            // 校园网 SSID（北航）
+#define WIFI_PASSWORD     ""                    // BUAA-WIFI 是开放网络，密码留空（OPEN 模式）
+#define MQTT_BROKER_ADDR  "broker.emqx.io"       // 公网 MQTT broker（默认）；需小车所在网络能上外网。BUAA-WIFI 要网页认证→上不了外网，可改用手机热点
+#define MQTT_BROKER_PORT  (1883)                // MQTT 端口
+#define MQTT_CLIENT_ID    "QST_Pioneer_3861"    // 客户端 ID（同一 broker 上需唯一）
+#define MQTT_SUB_TOPIC    "car/control"         // 订阅：手机/电脑往此主题发 W/A/S/D... 控车
+#define MQTT_PUB_TOPIC    "car/status"          // 发布：小车状态上报（可选）
 
 // ===================== 字模 =====================
 static const unsigned char F6x8[][6] =
@@ -243,7 +256,7 @@ static uint32_t SSD1306_WriteCmd(uint8_t byte)
   return SSD1306_SendData(buffer, sizeof(buffer));
 }
 
-static uint32_t SSD1306_WiteData(uint8_t byte)
+static uint32_t SSD1306_WriteData(uint8_t byte)
 {
   uint8_t buffer[] = {0x40, byte};
   return SSD1306_SendData(buffer, sizeof(buffer));
@@ -277,23 +290,23 @@ uint32_t SSD1306_Init(void)
     SSD1306_WriteCmd(0xa1);
     SSD1306_WriteCmd(0xa6);
     SSD1306_WriteCmd(0xa8);
-    SSD1306_WriteCmd(0x3F);
+    SSD1306_WriteCmd(0x1F);   // multiplex ratio=32（0.91寸 128×32 屏）；原 0x3F=64 是 128×64 参数，会让 32 行屏糊成一团
     SSD1306_WriteCmd(0xa4);
     SSD1306_WriteCmd(0xd3);
     SSD1306_WriteCmd(0x00);
     SSD1306_WriteCmd(0xd5);
     SSD1306_WriteCmd(0xf0);
     SSD1306_WriteCmd(0xd9);
-    SSD1306_WriteCmd(0x22);
+    SSD1306_WriteCmd(0x22);   // 预充电周期（SSD1306 上电默认值，绝大多数 128×32 屏适用）
     SSD1306_WriteCmd(0xda);
-    SSD1306_WriteCmd(0x12);
+    SSD1306_WriteCmd(0x02);   // COM pins=sequential（适配 32 行屏）；原 0x12 是 64 行配置
     SSD1306_WriteCmd(0xdb);
     SSD1306_WriteCmd(0x20);
     SSD1306_WriteCmd(0x8d);
     SSD1306_WriteCmd(0x14);
     SSD1306_WriteCmd(0xAF);
     SSD1306_SetPos(0,0);
-    printf("I2C SSD1306 Init is succeeded!!!");
+    printf("I2C SSD1306 Init is succeeded!!!\r\n");
     return 0;
 }
 
@@ -307,12 +320,12 @@ void SSD1306_SetPos(uint8_t x, uint8_t y)
 void SSD1306_Fill(uint8_t fill_Data)
 {
   unsigned char m, n;
-  for (m = 0; m < 8; m++) {
+  for (m = 0; m < 4; m++) {   // 128×32 屏只有 4 页，只清 4 页（原 8 页是 64 行屏写法）
     SSD1306_WriteCmd(0xb0 + m);
     SSD1306_WriteCmd(0x00);
     SSD1306_WriteCmd(0x10);
     for (n = 0; n < 128; n++)
-      SSD1306_WiteData(fill_Data);
+      SSD1306_WriteData(fill_Data);
   }
 }
 
@@ -327,22 +340,27 @@ void SSD1306_ShowStr(uint8_t x, uint8_t y, uint8_t ch[], uint8_t TextSize)
   switch (TextSize) {
   case 8:
     while (ch[j] != '\0') {
+      // 只渲染可打印 ASCII(32~126)：其他字节(控制符、中文的高字节)会令 ch[j]-32
+      // 超出 F6x8 的 95 项范围导致越界读，这里直接跳过。
+      if (ch[j] < 32 || ch[j] > 126) { j++; continue; }
       c = ch[j] - 32;
       if (x > 126) { x = 0; y++; }
       SSD1306_SetPos(x, y);
-      for (i = 0; i < 6; i++) SSD1306_WiteData(F6x8[c][i]);
+      for (i = 0; i < 6; i++) SSD1306_WriteData(F6x8[c][i]);
       x += 6; j++;
     }
     break;
   case 16:
     y *= 2;
     while (ch[j] != '\0') {
+      // 同上，避免 F8X16 越界读
+      if (ch[j] < 32 || ch[j] > 126) { j++; continue; }
       c = ch[j] - 32;
       if (x > 120) { x = 0; y++; }
       SSD1306_SetPos(x, y);
-      for (i = 0; i < 8; i++) SSD1306_WiteData(F8X16[c * 16 + i]);
+      for (i = 0; i < 8; i++) SSD1306_WriteData(F8X16[c * 16 + i]);
       SSD1306_SetPos(x, y + 1);
-      for (i = 0; i < 8; i++) SSD1306_WiteData(F8X16[c * 16 + i + 8]);
+      for (i = 0; i < 8; i++) SSD1306_WriteData(F8X16[c * 16 + i + 8]);
       x += 8; j++;
     }
     break;
@@ -357,9 +375,9 @@ void SSD1306_ShowChineseStr(uint8_t x, uint8_t y, uint8_t *str, uint8_t count)
     for (k = 0; k < count; k++) {
         if (x > 128 - 16) { x = 0; y += 2; }
         SSD1306_SetPos(x, y);
-        for (i = 0; i < 16; i++) SSD1306_WiteData(F16X16_CHN[k][i]);
+        for (i = 0; i < 16; i++) SSD1306_WriteData(F16X16_CHN[k][i]);
         SSD1306_SetPos(x, y + 1);
-        for (i = 0; i < 16; i++) SSD1306_WiteData(F16X16_CHN[k][i + 16]);
+        for (i = 0; i < 16; i++) SSD1306_WriteData(F16X16_CHN[k][i + 16]);
         x += 16;
     }
 }
@@ -394,23 +412,39 @@ uint32_t SHT20_ReadData(float *temp, float *humi)
 {
     uint32_t result;
     uint8_t buf[4] = {0};
+
+    // 【优化】SHT20 工作在 NoHoldMaster 模式：发完测量命令后由芯片内部完成转换，
+    // 这段等待期 I2C 总线是空闲的，完全没必要一直攥着互斥锁。
+    // 改为「发命令(加锁) → 等待转换(释放锁) → 读结果(加锁)」的分段式加锁：
+    // 锁的持有时间从 135ms(85+50) 降到 4 个毫秒级事务，OLED 刷屏不再被长时间阻塞。
     if (g_i2cMutex) osMutexAcquire(g_i2cMutex, osWaitForever);
     result = SHT20_WriteByte(SHT20_NoHoldMaster_Temp_REG_ADDR);
-    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
-    usleep(85 * 1000);
+    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
+    if (result != 0) return result;
+
+    usleep(85 * 1000);   // 温度转换等待（不持锁，期间其他设备可用 I2C）
+
+    if (g_i2cMutex) osMutexAcquire(g_i2cMutex, osWaitForever);
     result = SHT20_Recv(buf, 3);
-    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
+    if (result != 0) return result;
     // 【门槛破解2】SHT20 返回 16 位, 低 2 位是状态位, 必须 & 0xFFFC
     uint16_t t_raw = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]) & 0xFFFC;
     *temp = 175.72f * (t_raw / 65536.0f) - 46.85f;
+
+    if (g_i2cMutex) osMutexAcquire(g_i2cMutex, osWaitForever);
     result = SHT20_WriteByte(SHT20_NoHoldMaster_Humi_REG_ADDR);
-    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
-    usleep(50 * 1000);
+    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
+    if (result != 0) return result;
+
+    usleep(50 * 1000);   // 湿度转换等待（不持锁）
+
+    if (g_i2cMutex) osMutexAcquire(g_i2cMutex, osWaitForever);
     result = SHT20_Recv(buf, 3);
-    if (result != 0) { if (g_i2cMutex) osMutexRelease(g_i2cMutex); return result; }
+    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
+    if (result != 0) return result;
     uint16_t h_raw = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]) & 0xFFFC;
     *humi = 125.0f * (h_raw / 65536.0f) - 6.0f;
-    if (g_i2cMutex) osMutexRelease(g_i2cMutex);
     return 0;
 }
 
@@ -535,30 +569,47 @@ uint32_t AP3216C_Init(void)
 
 // ===================== UART1 蓝牙（BLE / JDY-16） =====================
 // 硬件：IO00=UART1_TXD, IO01=UART1_RXD（连 JDY-16 蓝牙模块）
-// 【关键根因】JDY-16 出厂默认波特率是 9600（AT+BAUD4），而系统启动把 UART1 初始化成 115200，
-//   两者不匹配 → Hi3861 按 115200 发、JDY-16 按 9600 收，全是乱码，手机自然收不到数据。
-//   所以必须重新 UartInit(UART1, 9600) 把波特率改成 9600，再固定引脚到 GPIO0/1。
-//   注：UartInit 只改波特率、不碰引脚（底层 hi_uart_init 不设置 IO 复用），所以这里顺序无妨，
-//   但为保险仍把 IoSetFunc 放在 UartInit 之后，确保 GPIO0/1 最终是 UART1。
+// 【波特率自适应】JDY-16 出厂波特率不唯一（常见 9600，也有 115200），而系统 peripheral_init()
+//   默认把 UART1 配成 115200（用于 AT/调试）。若模块波特率与 UART1 不一致，收到的数据全是乱码，
+//   表现就是"手机能连上但发指令没反应"。这里不猜：启动时依次尝试候选波特率，
+//   哪个能收到手机数据就锁定哪个（扫描逻辑见 BLE_RecvThread）。
+//   注：UartInit 只改波特率、不碰引脚（底层 hi_uart_init 不设置 IO 复用），故每次设完波特率
+//   都要重新 IoSetFunc，确保 GPIO_0/1 最终复用为 UART1。
 #define BLE_UART_IDX  WIFI_IOT_UART_IDX_1
-#define BLE_BAUDRATE  9600
 
-static void BLE_UartInit(void)
+// 候选波特率：系统 peripheral_init() 已把 UART1 默认配成 115200 给 JDY-16 用，
+// 所以模块最可能是 115200 —— 把它放第一个，上电即锁，不必等 3s 扫描。
+// 若模块实是其他波特率，再依次补试（9600 出厂也常见）。
+static const unsigned int g_bleBaudCands[] = {115200, 9600, 19200, 38400, 57600, 4800, 2400};
+#define BLE_BAUD_CAND_NUM  ((int)(sizeof(g_bleBaudCands) / sizeof(g_bleBaudCands[0])))
+static int g_bleBaudIdx = 0;      // 当前尝试的候选下标
+static int g_bleBaudTried = 0;    // 已切换过的候选数（防 UartInit 反复分配 RX 缓冲泄漏）
+static int g_bleBaudLocked = 0;   // 1=已锁定（收到过有效数据），不再切换
+
+// 设置蓝牙 UART1 波特率 + 重新固定引脚
+static void BLE_SetBaud(unsigned int baud)
 {
     WifiIotUartAttribute attr = {0};
-    attr.baudRate = BLE_BAUDRATE;
+    attr.baudRate = baud;
     attr.dataBits = WIFI_IOT_UART_DATA_BIT_8;
     attr.stopBits = WIFI_IOT_UART_STOP_BIT_1;
     attr.parity   = WIFI_IOT_UART_PARITY_NONE;
 
     if (UartInit(BLE_UART_IDX, &attr, NULL) != 0) {
-        printf("BLE UART1 init fail\r\n");
+        printf("BLE set baud %u FAILED\r\n", baud);
     }
-
+    // 每次改波特率后重新固定引脚（部分驱动 init 会重置 IO 复用）
     IoSetFunc(WIFI_IOT_IO_NAME_GPIO_0, WIFI_IOT_IO_FUNC_GPIO_0_UART1_TXD);
     IoSetFunc(WIFI_IOT_IO_NAME_GPIO_1, WIFI_IOT_IO_FUNC_GPIO_1_UART1_RXD);
+}
 
-    printf("BLE UART1 ready (baud=%d, JDY-16)\r\n", BLE_BAUDRATE);
+static void BLE_UartInit(void)
+{
+    // 从第一个候选开始（115200，与系统 peripheral_init 默认 UART1 波特率一致，最可能是模块真实波特率），
+    // 由 BLE_RecvThread 负责扫描并锁定（若模块实是其他波特率，手机发指令会触发切换到对应候选）
+    BLE_SetBaud(g_bleBaudCands[g_bleBaudIdx]);
+    printf("BLE UART1 ready (auto-baud, start %u, pin GPIO0/1, JDY-16)\r\n",
+           g_bleBaudCands[g_bleBaudIdx]);
 }
 
 // ===================== UART2 与 STM32 通信 + 双电机控制 =====================
@@ -627,19 +678,24 @@ static void stm32_motor_control(int motorA, int motorB)
 
 // 运动封装（对齐老师 robot_l9110s.c：正转=前进，反转=后退）
 // 若实测方向相反，把下面各函数的正负号整体取反即可（只改这一处）。
+// 无参数版：统一使用 CAR_DEFAULT_SPEED 油门；需要自定义速度时直接调 stm32_motor_control()。
 #define CAR_DEFAULT_SPEED 60   // 默认油门（约 40%）
 
-static void car_forward(unsigned char speed)
+static void car_forward(void)
 {
-    stm32_motor_control((int)speed, (int)speed);      // 两轮正转 = 前进
+    stm32_motor_control(CAR_DEFAULT_SPEED, CAR_DEFAULT_SPEED);      // 两轮正转 = 前进
 }
-static void car_backward(unsigned char speed)
+static void car_backward(void)
 {
-    stm32_motor_control(-(int)speed, -(int)speed);    // 两轮反转 = 后退
+    stm32_motor_control(-CAR_DEFAULT_SPEED, -CAR_DEFAULT_SPEED);    // 两轮反转 = 后退
 }
-static void car_left(unsigned char speed)
+static void car_left(void)
 {
-    stm32_motor_control(-(int)speed, (int)speed);     // 左退右进 = 车头左转（自主巡航避障用）
+    stm32_motor_control(-CAR_DEFAULT_SPEED, CAR_DEFAULT_SPEED);     // 左退右进 = 车头左转
+}
+static void car_right(void)
+{
+    stm32_motor_control(CAR_DEFAULT_SPEED, -CAR_DEFAULT_SPEED);     // 左进右退 = 车头右转
 }
 static void car_stop(void)
 {
@@ -650,12 +706,18 @@ static void car_stop(void)
 #define WS_PIN      WIFI_IOT_IO_NAME_GPIO_6
 #define WS_COUNT    12
 
-// 时序 nop 参数（按 Hi3861 主频估算：1 次循环 ≈ 25ns）
-// 若灯不亮或颜色明显偏色，把这 4 个值按同比例微调即可
-#define WS_NOP_T0H  14   // 0码高电平 ~350ns
-#define WS_NOP_T0L  32   // 0码低电平 ~800ns
-#define WS_NOP_T1H  28   // 1码高电平 ~700ns
-#define WS_NOP_T1L  24   // 1码低电平 ~600ns
+// 时序 nop 参数
+// 【已修正】Hi3861 的 CPU 主频 CONFIG_CPU_CLOCK = 160MHz（见 hi3861_platform_base.h，
+// hi_cpu.h 亦注明 "Default CPU clock is 160M"），即 1 个时钟周期约 6.25ns。
+// 原参数按 40MHz(≈25ns/循环)估算，在 160MHz 下实际电平宽度只有目标值的 1/4
+// （0码高电平仅 ~87ns，规格要求 ~350ns）→ WS2812 无法识别数据，灯不亮或严重偏色。
+// 现按 160MHz 重算：ws_nops 每次循环约 2 个周期(≈12.5ns)，对应
+//   0码高 350ns→28   0码低 800ns→64   1码高 700ns→56   1码低 600ns→48
+// 若实测颜色仍有偏差，把这 4 个值按同比例微调即可。
+#define WS_NOP_T0H  28   // 0码高电平 ~350ns
+#define WS_NOP_T0L  64   // 0码低电平 ~800ns
+#define WS_NOP_T1H  56   // 1码高电平 ~700ns
+#define WS_NOP_T1L  48   // 1码低电平 ~600ns
 
 static void ws_nops(unsigned int n)
 {
@@ -729,16 +791,16 @@ static float HCSR04_GetDistance(void)
     hi_udelay(20);
     GpioSetOutputVal(HC_TRIG, WIFI_IOT_GPIO_VALUE0);
 
-    // 等 ECHO 变高（最多等 100ms）
-    due = hi_get_us() + 100000;
+    // 等 ECHO 变高（最多等 40ms，对应约 6.8m；空旷无回波时避免长时间阻塞线程）
+    due = hi_get_us() + 40000;
     while (hi_get_us() < due) {
         GpioGetInputVal(HC_ECHO, &v);
         if (v == WIFI_IOT_GPIO_VALUE1) { t0 = hi_get_us(); break; }
     }
     if (t0 == 0) return -1.0f;
 
-    // 等 ECHO 变低，得到高电平持续时间
-    due = hi_get_us() + 100000;
+    // 等 ECHO 变低，得到高电平持续时间（最多等 40ms）
+    due = hi_get_us() + 40000;
     while (hi_get_us() < due) {
         GpioGetInputVal(HC_ECHO, &v);
         if (v == WIFI_IOT_GPIO_VALUE0) { t1 = hi_get_us(); break; }
@@ -771,46 +833,6 @@ static void TCRT_Read(uint8_t *leftNoReflect, uint8_t *rightNoReflect)
     WifiIotGpioValue vR = WIFI_IOT_GPIO_VALUE0;
     *leftNoReflect = (GpioGetInputVal(TC_L, &vL) == 0 && vL == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
     *rightNoReflect = (GpioGetInputVal(TC_R, &vR) == 0 && vR == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
-}
-
-// ===================== 自主巡航：一直前进，遇边缘后退 + 左转 60 度 =====================
-// 蓝牙运动遥控已封存（见 BLE_HandleChar），小车由本线程自主驾驶。
-#define CLIFF_BACK_MS   300   // 检测到边缘后的后退时长(ms)，离开悬崖边
-#define TURN_60DEG_MS   300   // 左转 60 度的时长(ms) —— 需按实际车速标定：
-                              // 转不够就调大，转过头就调小（受电池电压/地面摩擦影响）
-
-static void AutoDriveThread(void *arg)
-{
-    (void)arg;
-    int lastCmd = -1;   // 0=已停 1=前进中；只在状态变化时下发，减少 UART2 通信量
-
-    osDelay(500);   // 上电后稍等，确保 STM32 已就绪，首帧前进指令不丢失
-    printf("AUTO DRIVE start: forward, on edge -> back + turn left 60deg\r\n");
-
-    while (1) {
-        uint8_t l = 0, r = 0;
-        TCRT_Read(&l, &r);
-
-        if (l || r) {
-            // 车底悬空（到边缘）：后退 -> 左转 60 度 -> 停
-            car_stop();
-            osDelay(50);
-            car_backward(CAR_DEFAULT_SPEED);
-            osDelay(CLIFF_BACK_MS);
-            car_left(CAR_DEFAULT_SPEED);      // 左轮退、右轮进 = 原地左转
-            osDelay(TURN_60DEG_MS);
-            car_stop();
-            lastCmd = 0;
-            printf("EDGE detected: back + turn left 60deg\r\n");
-            osDelay(300);   // 冷却，避免边缘抖动导致连续触发
-        } else if (lastCmd != 1) {
-            // 正常：持续前进（STM32 收到一帧即保持该速度，不必每周期重发）
-            car_forward(CAR_DEFAULT_SPEED);
-            lastCmd = 1;
-        }
-
-        osDelay(50);   // 50ms 检测周期（防掉落需高频，不能只靠 Reader 线程的 3s）
-    }
 }
 
 // ===================== 内置 LED 联动逻辑 =====================
@@ -863,7 +885,7 @@ static void Sensor_ProducerThread(void *arg)
     while (1) {
         if (g_semRead) osSemaphoreRelease(g_semRead);
         if (g_semDisp) osSemaphoreRelease(g_semDisp);
-        osDelay(300);  // 300 tick ≈ 3s（按系统 tick = 10ms）
+        osDelay(300);  // LiteOS-M tick=1ms，故 300 tick = 300ms；传感器约 3.3Hz 刷新
     }
 }
 
@@ -902,7 +924,7 @@ static void Sensor_ReaderThread(void *arg)
         float dist = HCSR04_GetDistance();
         g_distance = dist;
 
-        // 红外巡线（IO13/IO14 输入，低电平=黑线）
+        // 红外巡线（IO13/IO14 输入，高电平=无反射=黑线/悬空，与 TCRT_Read 实现一致）
         TCRT_Read(&g_leftBlack, &g_rightBlack);
 
         int ti = (int)(temp * 100.0f + (temp >= 0 ? 0.5f : -0.5f));
@@ -912,19 +934,6 @@ static void Sensor_ReaderThread(void *arg)
                (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100,
                als, ps, ir, (int)(dist < 0 ? -1 : dist),
                g_leftBlack ? "L" : "-", g_rightBlack ? "R" : "-");
-
-        // 主动把同一份数据推送给蓝牙（手机端）
-        // 注意：printf 走的是调试串口，蓝牙是独立的 UART1(IO00/01)，两者并不共用，
-        //       所以必须主动 UartWrite，手机 App 才能持续收到数据。
-        char bleLine[96];
-        int n = snprintf(bleLine, sizeof(bleLine),
-                         "T=%s%d.%02dC H=%d.%02d%% L=%u P=%u I=%u D=%dcm TCRT=%s%s\r\n",
-                         (ti < 0) ? "-" : "", ta / 100, ta % 100, hi / 100, hi % 100,
-                         als, ps, ir, (int)(dist < 0 ? -1 : dist),
-                         g_leftBlack ? "L" : "-", g_rightBlack ? "R" : "-");
-        if (n > 0) {
-            UartWrite(BLE_UART_IDX, (unsigned char *)bleLine, (unsigned int)n);
-        }
     }
 }
 
@@ -933,7 +942,19 @@ static void Sensor_DisplayThread(void *arg)
 {
     (void)arg;
     char line[32];
-    char blank[33] = "                                ";  // 32空格 + NUL，避免 ShowStr 越界读
+    // 清行缓冲：128 像素 / 6 像素每字符 ≈ 21.3，取 21 字符（21×6=126<128），
+    // 避免越界（页地址模式下列地址到 127 会回绕到本页列 0，覆盖行首字符）
+    char blank[22];
+    memset(blank, ' ', 21);
+    blank[21] = '\0';
+
+    // 防御 GPIO_6 复用冲突：系统 app_io_init() 默认把 GPIO_6 配成 UART1_TXD（AT 口默认脚），
+    // 而 GPIO_6 同时是 WS2812 灯带数据线。若系统初始化晚于本应用执行，GPIO_6 会被抢成
+    // UART1_TXD —— 灯不亮，且 UART1 发数据时波形串到灯带导致乱闪。
+    // 任务运行时（系统初始化早已结束）明确设回普通 GPIO 输出，确保灯带受控。
+    IoSetFunc(WS_PIN, WIFI_IOT_IO_FUNC_GPIO_6_GPIO);
+    GpioSetDir(WS_PIN, WIFI_IOT_GPIO_DIR_OUT);
+
     while (1) {
         osSemaphoreAcquire(g_semDisp, osWaitForever);
 
@@ -962,21 +983,38 @@ static void Sensor_DisplayThread(void *arg)
 
 // thread4：蓝牙接收（从零重写）—— 逐字节解析，避免粘包丢指令
 //   查询指令：T=温湿度, L=光感, R=巡线
-//   运动指令：W=前进, S=后退, A=左转, D=右转, X=停止（用 WASD+X，避开 T/L/R 不冲突）
+//   运动指令：O=停止, W=前进, S=后退, A=左转, D=右转, I=定速前进(100), K=定速前进(150)（避开 T/L/R 不冲突）
 
-// 往蓝牙发一行字符串（自动带 \r\n 由调用方决定，这里只发原始字节）
-static void BLE_SendStr(const char *s)
+// 处理手机发来的一个字节指令（逐字节，粘包也不丢）
+// 判断是否为合法指令字节（仅用于波特率锁定的判定）
+// 注意：只认真正的指令字母 W/A/S/D/O/I/K/T/L/R（含大小写）。
+//       【之前把 \r \n 空格 也算合法 → 波特率不匹配时模块吐出的乱码若恰好是
+//       0x0D/0x0A/0x20 就会误锁在错误波特率上，导致之后永远收不到真指令。】
+//       行结束符/空格在 BLE_HandleChar 里仍作为无操作字节正常忽略，这里只收紧锁定判据。
+static int BLE_IsValidCmd(unsigned char c)
 {
-    if (s != NULL) {
-        UartWrite(BLE_UART_IDX, (const unsigned char *)s, (unsigned int)strlen(s));
+    switch (c) {
+        case 'W': case 'w': case 'A': case 'a': case 'S': case 's':
+        case 'D': case 'd': case 'O': case 'o': case 'I': case 'i':
+        case 'K': case 'k': case 'T': case 't': case 'L': case 'l':
+        case 'R': case 'r':
+            return 1;
+        default:
+            return 0;
     }
 }
 
-// 处理手机发来的一个字节指令（逐字节，粘包也不丢）
 static void BLE_HandleChar(unsigned char ch)
 {
     char resp[64];
     int n;
+
+    // [DEBUG] 收到任意字节都打到调试串口，用于定位「连上收不到」：
+    //   插 USB 看调试串口，手机发 W 应出现 "BLE RX: 0x57"
+    //   - 有这行但车不动 → 解析/执行问题（代码层）
+    //   - 完全没有这行 → 模块波特率/接线/透传问题（硬件层，与代码无关）
+    //   稳定后可把下面这行注释掉，避免刷屏。
+    printf("BLE RX: 0x%02X\r\n", ch);
 
     switch (ch) {
         // ---- 查询指令 ----
@@ -1004,21 +1042,35 @@ static void BLE_HandleChar(unsigned char ch)
             if (n > 0) UartWrite(BLE_UART_IDX, (unsigned char *)resp, (unsigned int)n);
             break;
 
-        // ---- 运动指令：已封存 ----
-        // 当前为「自主巡航模式」，小车由 AutoDriveThread 自主驾驶（一直前进、遇边缘后退+左转60度）。
-        // 蓝牙只保留 T/L/R 数据查询，运动遥控不再生效，避免与自主逻辑抢 UART2。
+        // ---- 运动指令（蓝牙遥控，封版） ----
+        // O=停止  W=前进  S=后退  A=左转  D=右转  I=定速前进100  K=定速前进150
+        case 'O':
+        case 'o':
+            car_stop();
+            break;
         case 'W':
         case 'w':
+            car_forward();
+            break;
         case 'S':
         case 's':
+            car_backward();
+            break;
         case 'A':
         case 'a':
+            car_left();
+            break;
         case 'D':
         case 'd':
-        case 'X':
-        case 'x':
-        case ' ':
-            BLE_SendStr("(remote disabled: auto drive mode)\r\n");
+            car_right();
+            break;
+        case 'I':
+        case 'i':
+            stm32_motor_control(100, 100);   // 定速前进 100
+            break;
+        case 'K':
+        case 'k':
+            stm32_motor_control(150, 150);   // 定速前进 150（最快）
             break;
 
         // ---- 忽略回车换行等无意义字节 ----
@@ -1036,15 +1088,52 @@ static void BLE_RecvThread(void *arg)
 {
     (void)arg;
     unsigned char buf[64];
+    int noDataTicks = 0;   // 连续无数据次数（每次约 200ms，见下面 read timeout）
 
     while (1) {
-        int len = UartRead(BLE_UART_IDX, buf, sizeof(buf));
+        // 用带超时的读：无数据时 200ms 后返回 0。
+        // 不用普通 UartRead —— 它会按 rx_block 配置阻塞，导致"超时切换波特率"逻辑卡死走不到。
+        int len = hi_uart_read_timeout((hi_uart_idx)BLE_UART_IDX, buf, sizeof(buf), 200);
+
         if (len > 0) {
+            // 只有收到"合法指令字节"才认为波特率对并锁定（乱码不锁定）
+            int valid = 0;
+            for (int i = 0; i < len; i++) {
+                if (BLE_IsValidCmd(buf[i])) { valid = 1; break; }
+            }
+            if (valid && !g_bleBaudLocked) {
+                g_bleBaudLocked = 1;
+                printf("BLE baud LOCKED: %u (rx %d bytes)\r\n",
+                       g_bleBaudCands[g_bleBaudIdx], len);
+            }
             for (int i = 0; i < len; i++) {
                 BLE_HandleChar(buf[i]);   // 逐字节解析，粘包也不丢指令
             }
+            noDataTicks = 0;
+            continue;
         }
-        osDelay(10);   // 轮询间隙；若 UartRead 是阻塞式，此句仅作兜底
+
+        // 无数据：未锁定则每 3 秒切到下一个候选波特率（BLE_SetBaud 内部会重设引脚）
+        // 【防泄漏】BLE_SetBaud 每次都会 UartInit 重新分配 RX 环形缓冲。若永远收不到有效数据，
+        // 每 3s 调一次会持续泄漏内存。故：把所有候选各试一遍(约 21s)后仍无有效数据，
+        // 就提交到最可能的 115200 并停止扫描，不再反复 UartInit。
+        if (!g_bleBaudLocked) {
+            if (++noDataTicks >= 15) {   // 15 × 200ms = 3s
+                noDataTicks = 0;
+                if (g_bleBaudTried < BLE_BAUD_CAND_NUM) {
+                    g_bleBaudTried++;
+                    g_bleBaudIdx = (g_bleBaudIdx + 1) % BLE_BAUD_CAND_NUM;
+                    BLE_SetBaud(g_bleBaudCands[g_bleBaudIdx]);
+                    printf("BLE baud try: %u\r\n", g_bleBaudCands[g_bleBaudIdx]);
+                } else if (g_bleBaudTried == BLE_BAUD_CAND_NUM) {
+                    g_bleBaudTried++;   // 仅提交一次
+                    g_bleBaudIdx = 0;   // 提交到 115200（系统默认，最可能为模块真实波特率）
+                    BLE_SetBaud(g_bleBaudCands[0]);
+                    printf("BLE auto-baud done: commit 115200 (send any cmd to lock)\r\n");
+                }
+                // g_bleBaudTried > CAND_NUM：停止扫描，保持 115200 等待锁定
+            }
+        }
     }
 }
 
@@ -1072,9 +1161,113 @@ static void I2c_InitThread(void *arg)
 }
 
 // 入口：只做不依赖 I2C 的初始化 + 创建所有线程；I2C 初始化交给独立线程（thread5）
+/* ===================== WiFi + MQTT 远程控车 ===================== */
+extern int WifiConnect(const char *ssid, const char *psk);
+extern int GetStationIP(char *ipbuf, int buflen);
+
+static MQTTClient g_mqttClient;
+static Network   g_mqttNet;
+static unsigned char g_mqttSendBuf[256];
+static unsigned char g_mqttReadBuf[1024];
+
+// MQTT 收到指令回调：payload 首字符即遥控指令（与蓝牙同一套），复用运动函数
+static void MQTT_MessageArrived(MessageData *data)
+{
+    if (data == NULL || data->message == NULL) return;
+    int len = (int)data->message->payloadlen;
+    char *payload = (char *)data->message->payload;
+    if (len <= 0 || payload == NULL) return;
+
+    printf("MQTT RX on %.*s: %.*s\r\n",
+           data->topicName->lenstring.len, data->topicName->lenstring.data,
+           len, payload);
+
+    char ch = payload[0];
+    switch (ch) {
+        case 'O': case 'o': car_stop();                    break;
+        case 'W': case 'w': car_forward();                 break;
+        case 'S': case 's': car_backward();               break;
+        case 'A': case 'a': car_left();                    break;
+        case 'D': case 'd': car_right();                   break;
+        case 'I': case 'i': stm32_motor_control(100, 100); break;
+        case 'K': case 'k': stm32_motor_control(150, 150); break;
+        default: break;   // 其它字符忽略
+    }
+}
+
+static void WifiMqttThread(void *arg)
+{
+    (void)arg;
+    int rc;
+
+    printf("=== WiFi+MQTT thread start ===\r\n");
+
+    // 1) 连 WiFi（PSK 方式）
+    if (WifiConnect(WIFI_SSID, WIFI_PASSWORD) != 0) {
+        printf("!!! WifiConnect failed, MQTT disabled\r\n");
+        return;
+    }
+    char ip[16] = {0};
+    if (GetStationIP(ip, sizeof(ip)) == 0) {
+        printf("WiFi connected, IP=%s\r\n", ip);
+    } else {
+        printf("WiFi connected, IP unknown\r\n");
+    }
+
+    // 2) 初始化 paho 网络与客户端
+    NetworkInit(&g_mqttNet);
+    MQTTClientInit(&g_mqttClient, &g_mqttNet, 30000,
+                   g_mqttSendBuf, sizeof(g_mqttSendBuf),
+                   g_mqttReadBuf, sizeof(g_mqttReadBuf));
+
+    // 3) 连接 broker（用局部数组避免字符串字面量传 char* 告警）
+    char broker_addr[64];
+    strncpy(broker_addr, MQTT_BROKER_ADDR, sizeof(broker_addr) - 1);
+    broker_addr[sizeof(broker_addr) - 1] = '\0';
+    if ((rc = NetworkConnect(&g_mqttNet, broker_addr, MQTT_BROKER_PORT)) != 0) {
+        printf("!!! MQTT NetworkConnect failed: %d\r\n", rc);
+        return;
+    }
+
+    // 启动后台保活/收消息线程（MQTTLiteOS 实现；返回值 0=失败，但不阻塞后续）
+    if (MQTTStartTask(&g_mqttClient) == 0) {
+        printf("WARN MQTTStartTask failed\r\n");
+    }
+
+    MQTTPacket_connectData connectData = MQTTPacket_connectData_initializer;
+    connectData.MQTTVersion = 4;   // 3.1.1
+    char client_id[32];
+    strncpy(client_id, MQTT_CLIENT_ID, sizeof(client_id) - 1);
+    client_id[sizeof(client_id) - 1] = '\0';
+    connectData.clientID.cstring = client_id;
+    if ((rc = MQTTConnect(&g_mqttClient, &connectData)) != 0) {
+        printf("!!! MQTTConnect failed: %d\r\n", rc);
+        return;
+    }
+    printf("MQTT connected to %s:%d\r\n", broker_addr, (int)MQTT_BROKER_PORT);
+
+    // 4) 订阅控制主题
+    if ((rc = MQTTSubscribe(&g_mqttClient, MQTT_SUB_TOPIC, QOS1, MQTT_MessageArrived)) != 0) {
+        printf("!!! MQTTSubscribe failed: %d\r\n", rc);
+    } else {
+        printf("MQTT subscribed: %s\r\n", MQTT_SUB_TOPIC);
+    }
+
+    // 5) 后台线程自动维持连接与接收；主循环可在此周期上报状态
+    while (1) {
+        osDelay(1000);
+        // 如需上报：MQTTPublish(g_mqttClient, MQTT_PUB_TOPIC, &msg);
+    }
+}
+
 static void I2c_Ssd1306_Demo(void)
 {
     printf("=== APP INIT START ===\r\n");
+
+    // 显式初始化 GPIO 模块：确保在调用任何 GpioSetFunc/GpioSetDir 之前 GPIO 子系统已就绪。
+    // （此前 GpioInit 只在 SSD1306_Init 内调用，而本线程的 WS2812/HCSR04/TCRT/UART 初始化更早执行 GPIO 操作，
+    //  属于隐式依赖系统 peripheral_init 已调过 GpioInit。这里显式调一次，消除该依赖；重复调用幂等。）
+    GpioInit();
 
     g_i2cMutex = osMutexNew(NULL);
     printf("=== mutex done ===\r\n");
@@ -1082,7 +1275,7 @@ static void I2c_Ssd1306_Demo(void)
     // ① 纯 GPIO 外设（不依赖 I2C）
     WS2812_Init();   // 内置 WS2812 灯带（IO06）
     HCSR04_Init();   // 超声波 HC-SR04（IO07=TRIG, IO08=ECHO）
-    TCRT_Init();     // 车底检测 CGQ1/CGQ2（IO13=左，IO14=右，自主巡航的边缘检测）
+    TCRT_Init();     // 车底检测 CGQ1/CGQ2（IO13=左，IO14=右，T/R 查询与日志用）
     printf("=== GPIO init done ===\r\n");
 
     // ② UART 外设
@@ -1099,20 +1292,26 @@ static void I2c_Ssd1306_Demo(void)
     attr.stack_size = 1024 * 4;
     attr.priority = osPriorityNormal;
 
-    attr.name = "thread1";
-    osThreadNew((osThreadFunc_t)Sensor_ProducerThread, NULL, &attr);
-    attr.name = "thread2";
-    osThreadNew((osThreadFunc_t)Sensor_ReaderThread, NULL, &attr);
-    attr.name = "thread3";
-    osThreadNew((osThreadFunc_t)Sensor_DisplayThread, NULL, &attr);
-    attr.name = "thread4";
-    osThreadNew((osThreadFunc_t)BLE_RecvThread, NULL, &attr);
-    attr.name = "thread5";
-    osThreadNew((osThreadFunc_t)I2c_InitThread, NULL, &attr);   // I2C 初始化独立线程
-    attr.name = "thread6";
-    osThreadNew((osThreadFunc_t)AutoDriveThread, NULL, &attr);  // 自主巡航：一直前进 + 遇边缘后退左转60度
+    // Hi3861 的 LiteOS-M 对任务数有上限(默认 LOSCFG_BASE_CORE_TSK_LIMIT=64),
+    // 若创建失败 osThreadNew 返回 NULL 且静默不跑, 这里逐一校验以免「功能莫名失效」。
+    osThreadId_t tid;
+#define SAFE_NEW(tname, fn) do { \
+        attr.name = tname; \
+        tid = osThreadNew((osThreadFunc_t)(fn), NULL, &attr); \
+        if (tid == NULL) printf("!!! THREAD CREATE FAILED: %s (task limit or stack OOM?)\r\n", tname); \
+    } while (0)
+
+    SAFE_NEW("thread1", Sensor_ProducerThread);
+    SAFE_NEW("thread2", Sensor_ReaderThread);
+    SAFE_NEW("thread3", Sensor_DisplayThread);
+    SAFE_NEW("thread4", BLE_RecvThread);
+    SAFE_NEW("thread5", I2c_InitThread);   // I2C 初始化独立线程
+    SAFE_NEW("thread6", WifiMqttThread);    // WiFi+MQTT 远程控车
 
     printf("=== ALL THREADS STARTED ===\r\n");
 }
 
-APP_FEATURE_INIT(I2c_Ssd1306_Demo);
+// 用 SYS_RUN 而非 APP_FEATURE_INIT：APP_FEATURE_INIT 依赖 SAMGR 运行时动态扫描，
+// 精简固件里可能不被调用导致任务全不起；SYS_RUN 注册进 .zinitcall.run2.init，
+// 内核完成基础硬件初始化后由 main() 无条件直接调用，确保任务 100% 随开机直启。
+SYS_RUN(I2c_Ssd1306_Demo);
