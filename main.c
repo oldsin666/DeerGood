@@ -568,6 +568,9 @@ uint32_t AP3216C_Init(void)
 }
 
 // ===================== UART1 蓝牙（BLE / JDY-16） =====================
+// 【暂时屏蔽蓝牙】ENABLE_BLE=0 时不初始化 UART1、不创建接收线程、不解析指令，仅自主巡逻。
+// 要恢复蓝牙遥控时把下面宏改成 1 重编即可。
+#define ENABLE_BLE 0
 // 硬件：IO00=UART1_TXD, IO01=UART1_RXD（连 JDY-16 蓝牙模块）
 // 【波特率自适应】JDY-16 出厂波特率不唯一（常见 9600，也有 115200），而系统 peripheral_init()
 //   默认把 UART1 配成 115200（用于 AT/调试）。若模块波特率与 UART1 不一致，收到的数据全是乱码，
@@ -575,6 +578,7 @@ uint32_t AP3216C_Init(void)
 //   哪个能收到手机数据就锁定哪个（扫描逻辑见 BLE_RecvThread）。
 //   注：UartInit 只改波特率、不碰引脚（底层 hi_uart_init 不设置 IO 复用），故每次设完波特率
 //   都要重新 IoSetFunc，确保 GPIO_0/1 最终复用为 UART1。
+#if ENABLE_BLE
 #define BLE_UART_IDX  WIFI_IOT_UART_IDX_1
 
 // 候选波特率：系统 peripheral_init() 已把 UART1 默认配成 115200 给 JDY-16 用，
@@ -611,6 +615,7 @@ static void BLE_UartInit(void)
     printf("BLE UART1 ready (auto-baud, start %u, pin GPIO0/1, JDY-16)\r\n",
            g_bleBaudCands[g_bleBaudIdx]);
 }
+#endif  // ENABLE_BLE
 
 // ===================== UART2 与 STM32 通信 + 双电机控制 =====================
 // 硬件：IO11=UART2_TXD, IO12=UART2_RXD（连 STM32）
@@ -624,6 +629,7 @@ static void BLE_UartInit(void)
 #define MOTOR_FRAME_TAIL 0xFD
 
 static int g_motorUartReady = 0;   // UART2 初始化成功标志
+static int g_motorDbgDone = 0;     // 首次尝试发帧时打一条诊断，定位「车不动」是卡在 UART 还是 STM32 侧
 
 // 与蓝牙 UART1 不同，UART2 系统没有初始化过，这里必须主动 UartInit
 static void Motor_UartInit(void)
@@ -654,6 +660,10 @@ static void stm32_motor_control(int motorA, int motorB)
     unsigned char aDir = 0, bDir = 0;   // 0=正转, 1=反转
 
     if (!g_motorUartReady) {
+        if (!g_motorDbgDone) {          // 只打一次，避免刷屏
+            g_motorDbgDone = 1;
+            printf("MOTOR BLOCKED: UART2 not ready, no frame sent\r\n");
+        }
         return;   // UART2 未就绪时不发，避免访问无效驱动导致异常
     }
 
@@ -674,6 +684,12 @@ static void stm32_motor_control(int motorA, int motorB)
     buf[5] = MOTOR_FRAME_TAIL;
 
     UartWrite(MOTOR_UART_IDX, buf, sizeof(buf));
+
+    if (!g_motorDbgDone) {              // 首次成功发帧打一条，证明 UART2 链路在发数据
+        g_motorDbgDone = 1;
+        printf("MOTOR first frame: A(dir=%u spd=%u) B(dir=%u spd=%u)\r\n",
+               (unsigned)aDir, (unsigned)motorA, (unsigned)bDir, (unsigned)motorB);
+    }
 }
 
 // 运动封装（对齐老师 robot_l9110s.c：正转=前进，反转=后退）
@@ -681,14 +697,62 @@ static void stm32_motor_control(int motorA, int motorB)
 // 无参数版：统一使用 CAR_DEFAULT_SPEED 油门；需要自定义速度时直接调 stm32_motor_control()。
 #define CAR_DEFAULT_SPEED 60   // 默认油门（约 40%）
 
+// ===================== 自主巡逻（围场避障 + 黑胶带禁区）配置 =====================
+// 上电默认进入自主巡逻：超声波防撞 + TCRT 检测黑胶带禁区边界不越线。
+// 蓝牙运动指令(O/W/A/S/D/I/K)可临时接管（暂停自主 MANUAL_OVERRIDE_TICKS 个 tick），方便手动救车。
+#define ENABLE_WIFI           0       // 1=启动 WiFi/MQTT 任务  0=自主巡逻模式（停 WiFi）
+#define AUTON_SAFE_DIST_CM   30      // 前向障碍安全距离(cm)，小于此触发后退+转向（实车可调）
+#define AUTON_BACK_TICKS     0       // 单侧压线：不直线倒车！车尾无传感器，盲退易把车屁股送出活动区域；原地转向即可脱离
+#define AUTON_BACK_HEAVY     2       // 双侧同时压线（车头垂直顶线）：最短慢速微退让前轮离线再转向（原3→2）
+#define AUTON_BACK_SPEED     30      // 倒车油门 = 默认一半（60→30）：慢退减小车尾盲退位移（车尾无探测，越少越好）
+#define AUTON_TURN_TICKS     2       // 单侧压线/遇障：转向【最大】tick 数（闭环确认会提前结束；原6 → 缩至1/3）
+#define AUTON_TURN_HEAVY     5       // 双侧压线：转向最大 tick 数（原14 → 缩至1/3，接近原掉头幅度的1/3）
+#define AUTON_TURN_MIN       1       // 转向至少持续 tick 数，之后才开始检测是否已脱离（原2；TCRT 已 100ms 新鲜采样，无数据陈旧问题）
+#define AUTON_LINE_CONFIRM   1       // 立即反应：TCRT 已提速到 100ms 直接采样，压线首帧即触发（原 2 + 300ms 采样会漏检细胶带）
+#define AUTON_STUCK_WINDOW   30      // 卡顿判定窗口(tick)：窗口内重复触发说明上次转向没解决问题
+#define AUTON_TICK_MS        100     // 自主巡逻主循环周期(ms)
+#define AUTON_LINE_SUBTICK   10      // 黑线子采样间隔(ms)：100ms 决策周期内细分多次采样，防窄胶带被整周期漏掉
+#define AUTON_SUB_LOOP       (AUTON_TICK_MS / AUTON_LINE_SUBTICK)  // 每个决策周期的子采样次数 = 10
+#define AUTON_LINE_HOLD      2       // 连续几次(×10ms=20ms)为高才算真压线，滤掉毛刺干扰导致的误动作
+#define AUTON_START_DELAY_S  0       // 开机延迟已关闭：上电即开始巡逻（0=不等待）。如需摆车时间改回 120
+#define AUTON_RUN_TIME_S     120     // 启动后自动巡逻总时长(秒)，到点后永久停车不再动作（2分钟）
+#define MANUAL_OVERRIDE_TICKS 60     // 收蓝牙指令后暂停自主的 tick 数(≈6s)
+
+// 自主状态机：0=前进(GO) 1=后退脱离(BACK) 2=转向脱离(TURN)
+static int g_autoMode = 0;
+static int g_autoTicks = 0;
+static int g_autoTurn = 0;       // 0=左转脱离 1=右转脱离
+static int g_turnTarget = 0;     // 本次转向的最大 tick（超时上限；闭环确认会提前结束）
+static int g_lineDeb = 0;        // 压线防抖计数
+static int g_obstDeb = 0;        // 前向障碍防抖计数
+static int g_recentTrig = 0;     // 距上次触发脱离的剩余窗口 tick（>0 = 仍在窗口内）
+static int g_stuckCount = 0;     // 窗口内重复触发次数（>=2 判定为卡住）
+static int g_lastTurn = 0;       // 上次转向方向（判定卡住后反向转）
+static int g_manualTicks = 0;    // >0 时暂停自主，交给蓝牙手动控制
+static uint32_t g_autoT0 = 0;     // 巡逻启动时刻(hi_get_us, 微秒)，用于运行限时
+static int g_autoStopped = 0;     // 1=已到点永久停车
+static unsigned int g_rndSeed = 0x1234u;
+
+// 简单可重入伪随机（不依赖 rand()，用 hi_get_us 提供熵）
+static int my_rand(void)
+{
+    g_rndSeed = g_rndSeed * 1103515245u + 12345u + (unsigned int)(hi_get_us() & 0xFFFFu);
+    return (int)((g_rndSeed >> 16) & 0x7FFF);
+}
+
 static void car_forward(void)
 {
     stm32_motor_control(CAR_DEFAULT_SPEED, CAR_DEFAULT_SPEED);      // 两轮正转 = 前进
 }
+// car_backward 仅 WIFI/BLE 遥控（W/S/A/D）使用；自主巡逻脱困已改为低速直调
+// stm32_motor_control(-AUTON_BACK_SPEED, ...)（车尾无传感器，不盲退全油门）。
+// ENABLE_WIFI=0 且 ENABLE_BLE=0 时无调用点，故条件编译，避免 -Werror unused-function。
+#if (ENABLE_WIFI || ENABLE_BLE)
 static void car_backward(void)
 {
     stm32_motor_control(-CAR_DEFAULT_SPEED, -CAR_DEFAULT_SPEED);    // 两轮反转 = 后退
 }
+#endif
 static void car_left(void)
 {
     stm32_motor_control(-CAR_DEFAULT_SPEED, CAR_DEFAULT_SPEED);     // 左退右进 = 车头左转
@@ -700,6 +764,25 @@ static void car_right(void)
 static void car_stop(void)
 {
     stm32_motor_control(0, 0);
+}
+
+// 触发一次"脱离"动作：先停 → 后退 backTicks（可 0=不退，直接原地转向）→ 转向（最多 turnMax，闭环确认会提前结束）
+// turnDir: 0=左转 1=右转，<0=随机方向
+// backTicks=0：车尾无传感器，单侧压线不盲退，直接原地转向脱离，避免车屁股超出活动区域
+// 定义在 car_* 之后，因为要调用 car_stop()
+static void Auton_StartEscape(int turnDir, int backTicks, int turnMax)
+{
+    car_stop();
+    g_turnTarget = turnMax;
+    g_autoTurn = (turnDir < 0) ? (my_rand() & 1) : turnDir;
+    g_lastTurn = g_autoTurn;
+    if (backTicks > 0) {
+        g_autoTicks = backTicks;
+        g_autoMode = 1;   // 需后退（垂直顶线让前轮离线）→ 先 BACK 后 TURN
+    } else {
+        g_autoTicks = turnMax;
+        g_autoMode = 2;   // 无需后退 → 直接 TURN（原地转向，整车位移最小）
+    }
 }
 
 // ===================== WS2812 内置 LED（IO06，车前后各 6 颗共 12 颗） =====================
@@ -766,6 +849,12 @@ static void WS2812_Init(void)
 }
 
 // ===================== HC-SR04 超声波（IO07=TRIG, IO08=ECHO） =====================
+// 【临时禁用超声波】模块故障，恒返回 0 —— 但避障判据是 (dist >= 0 && dist < 安全距离)，
+// 0 会被当成"紧贴障碍"，导致小车不停后退转向、根本无法前进。故整段禁用，仅测黑胶带禁区。
+// 超声波修好后，把下面宏改回 1 即可恢复（驱动/初始化/上电等待逻辑会一并重新编入）。
+#define ENABLE_SONAR 0
+
+#if ENABLE_SONAR
 #define HC_TRIG  WIFI_IOT_IO_NAME_GPIO_7
 #define HC_ECHO  WIFI_IOT_IO_NAME_GPIO_8
 
@@ -810,6 +899,7 @@ static float HCSR04_GetDistance(void)
     // 距离 = 高电平时间(us) * 0.034 / 2
     return (float)((double)(t1 - t0) * 0.034 / 2.0);
 }
+#endif  // ENABLE_SONAR
 
 // ===================== TCRT5000 车底检测（CGQ1=IO13, CGQ2=IO14） =====================
 // 原理图：CGQ1/CGQ2 是两个 TCRT5000 红外对管（车底），经 LM393 U22 比较器输出 TC_OUT_L/R -> IO13/IO14。
@@ -818,12 +908,20 @@ static float HCSR04_GetDistance(void)
 #define TC_L  WIFI_IOT_IO_NAME_GPIO_13
 #define TC_R  WIFI_IOT_IO_NAME_GPIO_14
 
+#define TCRT_ACTIVE_HIGH    1       // 1=高电平表示压到黑胶带（LM393 常见模块 & 老师参考代码 trace_model.c 一致）；实测反了改 0
+
 static void TCRT_Init(void)
 {
     IoSetFunc(TC_L, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
     GpioSetDir(TC_L, WIFI_IOT_GPIO_DIR_IN);
+    // 【关键修复】LM393 是集电极开路(开漏)输出，只能拉低、不能拉高：
+    // 压到黑胶带时输出管截止 = 引脚悬空。若模块板载上拉缺失/偏弱，电平就漂浮不定 ——
+    // 多数时刻读到低（判为安全 → "开过黑胶带没反应"），偶尔感应到高（→ "突然倒车/转向"）。
+    // 启用芯片内部上拉，把"悬空"稳定成确定的高电平，从根上消除这种随机误判。
+    IoSetPull(TC_L, WIFI_IOT_IO_PULL_UP);
     IoSetFunc(TC_R, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
     GpioSetDir(TC_R, WIFI_IOT_GPIO_DIR_IN);
+    IoSetPull(TC_R, WIFI_IOT_IO_PULL_UP);
 }
 
 // 读车底检测：1=检测到无反射(黑线/悬空)，0=有反射(地面正常)
@@ -831,8 +929,14 @@ static void TCRT_Read(uint8_t *leftNoReflect, uint8_t *rightNoReflect)
 {
     WifiIotGpioValue vL = WIFI_IOT_GPIO_VALUE0;
     WifiIotGpioValue vR = WIFI_IOT_GPIO_VALUE0;
-    *leftNoReflect = (GpioGetInputVal(TC_L, &vL) == 0 && vL == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
-    *rightNoReflect = (GpioGetInputVal(TC_R, &vR) == 0 && vR == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+    uint8_t lv = (GpioGetInputVal(TC_L, &vL) == 0 && vL == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+    uint8_t rv = (GpioGetInputVal(TC_R, &vR) == 0 && vR == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+#if !TCRT_ACTIVE_HIGH
+    lv = (uint8_t)!lv;   // 模块极性相反时：低电平 = 压到黑胶带
+    rv = (uint8_t)!rv;
+#endif
+    *leftNoReflect = lv;
+    *rightNoReflect = rv;
 }
 
 // ===================== 内置 LED 联动逻辑 =====================
@@ -870,7 +974,10 @@ static uint16_t g_ir = 0;
 static uint16_t g_als = 0;
 static int g_alsValid = 0;   // AP3216C 是否读到有效光照数据
 static uint16_t g_ps = 0;
-static float g_distance = -1.0f;   // 超声波距离(cm)，<0 表示没测到
+static float g_distance = -1.0f;   // 超声波距离(cm)，<0 表示没测到（禁用超声波时恒为 -1）
+#if ENABLE_SONAR
+static volatile int g_sonarReady = 0;  // 1=thread2 已完成首帧测距（自主巡逻据此才开始决策）
+#endif
 static int g_ledState = -1;        // 内置 LED 当前状态（见 Led_Update）
 static uint8_t g_leftBlack = 0;    // 1=左车底检测识别到无反射/黑线（IO13，高电平有效）
 static uint8_t g_rightBlack = 0;   // 1=右车底检测识别到无反射/黑线（IO14，高电平有效）
@@ -899,6 +1006,23 @@ static void Sensor_ReaderThread(void *arg)
 
         float temp = 0, humi = 0;
         uint16_t ir = 0, als = 0, ps = 0;
+        float dist;
+
+        // 超声波测距 + 红外巡线放在 I2C 读取【之前】：
+        // SHT20 单次转换要 usleep(85ms)+usleep(50ms)=135ms，若把测距排在它后面，
+        // g_distance 会被拖到刷新周期的末尾才更新，自主巡逻读到的数据要多陈旧 ~140ms。
+#if ENABLE_SONAR
+        dist = HCSR04_GetDistance();
+        g_distance = dist;
+        g_sonarReady = 1;   // 首帧测距完成（AutonomousThread 等这个标志才开始决策）
+#else
+        dist = -1.0f;       // 超声波禁用：恒为"无有效测距"，前向避障判据天然不成立
+        g_distance = dist;
+#endif
+
+        // 红外巡线已改由 AutonomousThread 每 100ms 直接采样（提速防漏检），此处不再读，
+        // 避免与 AutonomousThread 并发写 g_leftBlack/g_rightBlack。下面串口 TCRT= 打印读的是
+        // AutonomousThread 每 100ms 刷新的全局值。
 
         // 仅当 I2C 设备初始化完成才读（避免 I2C 卡死拖垮整个线程）
         if (g_i2cReady) {
@@ -919,13 +1043,6 @@ static void Sensor_ReaderThread(void *arg)
                 printf("AP3216C read fail\r\n");
             }
         }
-
-        // 超声波测距（GPIO 操作，不占 I2C 总线，无需加互斥锁）
-        float dist = HCSR04_GetDistance();
-        g_distance = dist;
-
-        // 红外巡线（IO13/IO14 输入，高电平=无反射=黑线/悬空，与 TCRT_Read 实现一致）
-        TCRT_Read(&g_leftBlack, &g_rightBlack);
 
         int ti = (int)(temp * 100.0f + (temp >= 0 ? 0.5f : -0.5f));
         int hi = (int)(humi * 100.0f + (humi >= 0 ? 0.5f : -0.5f));
@@ -991,6 +1108,7 @@ static void Sensor_DisplayThread(void *arg)
 //       【之前把 \r \n 空格 也算合法 → 波特率不匹配时模块吐出的乱码若恰好是
 //       0x0D/0x0A/0x20 就会误锁在错误波特率上，导致之后永远收不到真指令。】
 //       行结束符/空格在 BLE_HandleChar 里仍作为无操作字节正常忽略，这里只收紧锁定判据。
+#if ENABLE_BLE
 static int BLE_IsValidCmd(unsigned char c)
 {
     switch (c) {
@@ -1082,6 +1200,14 @@ static void BLE_HandleChar(unsigned char ch)
         default:
             break;   // 未知指令忽略（不回显，避免手机端刷屏）
     }
+
+    // 运动指令触发人工接管：暂停自主巡逻一段时间，便于手动救车（卡住/调参时）
+    if (ch == 'W' || ch == 'w' || ch == 'A' || ch == 'a' || ch == 'S' || ch == 's' ||
+        ch == 'D' || ch == 'd' || ch == 'O' || ch == 'o' || ch == 'I' || ch == 'i' ||
+        ch == 'K' || ch == 'k') {
+        g_manualTicks = MANUAL_OVERRIDE_TICKS;
+        g_autoMode = 0;   // 接管结束恢复自主时从 GO 重新决策，避免残留 BACK/TURN 状态突然后退/转向
+    }
 }
 
 static void BLE_RecvThread(void *arg)
@@ -1136,6 +1262,7 @@ static void BLE_RecvThread(void *arg)
         }
     }
 }
+#endif  // ENABLE_BLE
 
 // thread5：I2C 设备初始化（独立线程）—— I2C 若卡死只卡本线程，不影响蓝牙/电机/其他
 static void I2c_InitThread(void *arg)
@@ -1162,6 +1289,7 @@ static void I2c_InitThread(void *arg)
 
 // 入口：只做不依赖 I2C 的初始化 + 创建所有线程；I2C 初始化交给独立线程（thread5）
 /* ===================== WiFi + MQTT 远程控车 ===================== */
+#if ENABLE_WIFI
 extern int WifiConnect(const char *ssid, const char *psk);
 extern int GetStationIP(char *ipbuf, int buflen);
 
@@ -1256,7 +1384,174 @@ static void WifiMqttThread(void *arg)
     // 5) 后台线程自动维持连接与接收；主循环可在此周期上报状态
     while (1) {
         osDelay(1000);
-        // 如需上报：MQTTPublish(g_mqttClient, MQTT_PUB_TOPIC, &msg);
+    }
+}
+
+#endif  // ENABLE_WIFI
+
+// ===================== 自主巡逻线程（围场避障 + 黑胶带禁区） =====================
+// 策略：黑胶带禁区(硬约束) > 前向障碍(软避障)。
+// 每 AUTON_TICK_MS 决策一次：安全则前进；压黑线则后退脱离再朝远离方向转；
+// 前方障碍则后退再随机方向转。脱离完成后回到前进，重新决策。
+static void AutonomousThread(void *arg)
+{
+    (void)arg;
+    printf("=== Autonomous patrol thread start ===\r\n");
+    g_autoMode = 0;
+    g_autoTicks = 0;
+
+    // 【开机延迟启动】上电后先静止等待 AUTON_START_DELAY_S 秒再开始巡逻，
+    // 留出把车摆进场地、人员撤离的时间。期间车保持停止（入口已发过停止帧，这里再发一次保险）。
+    // 分段延时：单次 osDelay 参数有上限，不能一次 osDelay(120000)。
+    // 恢复蓝牙后，这期间收到运动指令会立即结束等待开始巡逻，不用干等。
+    car_stop();
+    printf("=== patrol holds %d s before start ===\r\n", AUTON_START_DELAY_S);
+    for (int s = 0; s < AUTON_START_DELAY_S; s++) {
+        osDelay(1000);                      // 1 秒（tick=1ms）
+        if (g_manualTicks > 0) {
+            printf("=== manual cmd during hold, start now ===\r\n");
+            break;
+        }
+        if ((s + 1) % 10 == 0) {
+            printf("start in %d s\r\n", AUTON_START_DELAY_S - s - 1);
+        }
+    }
+    printf("=== hold done, patrol GO ===\r\n");
+
+    g_autoT0 = (uint32_t)hi_get_us();   // 记录巡逻启动时刻，用于"运行 AUTON_RUN_TIME_S 秒后停车"
+
+#if ENABLE_SONAR
+    // 【修复上电盲区】等 thread2 完成首帧测距再决策。
+    // g_distance 初值为 -1(无回波)，若一上来就决策，这个 -1 会被当成"前方空旷"直接前进，
+    // 而上电时车可能正对着墙 —— 前几百毫秒会撞上去才开始避障。
+    // 设 2s 上限兜底：超声波模块故障/未接时不能把车永久卡死在原地。
+    {
+        int waited = 0;
+        while (!g_sonarReady && waited < 20) {   // 20 × 100ms = 2s
+            osDelay(AUTON_TICK_MS);
+            waited++;
+        }
+        printf("=== sonar ready=%d, patrol GO (waited %dms) ===\r\n",
+               g_sonarReady, waited * AUTON_TICK_MS);
+    }
+#endif  // ENABLE_SONAR
+
+    while (1) {
+        // 【高频子采样 + 锁存】原来每 100ms 才读一次 TCRT，车速稍快、胶带稍窄就可能被整个
+        // 周期跳过（表现为"开过黑胶带没反应"）。改在一个决策周期内细分 10 次 10ms 采样：
+        // 任一次捕获到压线即锁存；并要求"连续 2 次(20ms)为高"才确认，滤掉毛刺干扰
+        // （避免浮空/噪声造成的"偶尔突然倒车"）。决策周期仍是 100ms，动作时长不受影响。
+        uint8_t lLatch = 0, rLatch = 0;
+        uint8_t lDeb = 0, rDeb = 0;
+        for (int sub = 0; sub < AUTON_SUB_LOOP; sub++) {
+            osDelay(AUTON_LINE_SUBTICK);
+            TCRT_Read(&g_leftBlack, &g_rightBlack);   // 全局同步刷新，供 thread2 的 TCRT= 打印
+            if (g_leftBlack)  { if (++lDeb >= AUTON_LINE_HOLD) lLatch = 1; } else { lDeb = 0; }
+            if (g_rightBlack) { if (++rDeb >= AUTON_LINE_HOLD) rLatch = 1; } else { rDeb = 0; }
+        }
+
+        // 【运行限时】启动后自动巡逻 AUTON_RUN_TIME_S 秒，到点永久停车（用户要求：跑两分钟停）。
+        if (!g_autoStopped &&
+            ((uint32_t)hi_get_us() - g_autoT0) >= (AUTON_RUN_TIME_S * 1000000UL)) {
+            g_autoStopped = 1;
+            car_stop();
+            printf("=== patrol auto-stop after %d s ===\r\n", AUTON_RUN_TIME_S);
+        }
+        if (g_autoStopped) {
+            car_stop();        // 持续保持停车，不再做任何决策
+            continue;
+        }
+
+        // 蓝牙人工接管：倒计时内不自动控车，让手机/电脑蓝牙指令直接控制
+        if (g_manualTicks > 0) {
+            g_manualTicks--;
+            continue;
+        }
+
+        // 【提速防漏检】原来复用 thread2 每 300ms 刷新的全局值，车速稍快就跨过细胶带漏采样。
+        // 现改为这里直接读 TCRT（GpioGetInputVal 微秒级、原子读，无 HC-SR04 那种时序敏感），
+        // 100ms 采样，3 倍于原来。超声波已禁用(ENABLE_SONAR=0)，HC-SR04 不会与本线程并发，
+        // 故直接读 TCRT 无竞争风险；thread2 已不再读 TCRT，避免并发写 g_leftBlack/g_rightBlack。
+        uint8_t l = lLatch;   // 1=本周期内压到黑胶带(禁区边界)，来自 10ms 子采样锁存
+        uint8_t r = rLatch;
+        float dist = g_distance;   // cm, <0 表示无回波/超时
+
+        if (g_recentTrig > 0) g_recentTrig--;   // 卡顿判定窗口倒计时
+
+        // 统一安全判据：不压黑线 且 前方无障碍（两种触发共用，脱离判定更严谨）
+        int isClear = !(l || r) && !(dist >= 0.0f && dist < AUTON_SAFE_DIST_CM);
+
+        if (g_autoMode == 0) {
+            // ---- GO：安全则前进 ----
+            if (l || r) {
+                // 黑胶带禁区（硬约束，优先级最高）
+                g_obstDeb = 0;
+                car_stop();          // 疑似压线先停，防抖确认期间不再继续侵入
+                if (++g_lineDeb >= AUTON_LINE_CONFIRM) {
+                    g_lineDeb = 0;
+                    int heavy = (l && r);   // 双侧同时压 = 车头垂直撞上禁区边界
+                    int dir;
+                    // 卡顿检测：窗口内重复触发，说明上次转的方向没解决问题
+                    if (g_recentTrig > 0) g_stuckCount++; else g_stuckCount = 0;
+                    g_recentTrig = AUTON_STUCK_WINDOW;
+                    if (g_stuckCount >= 2) {
+                        dir = !g_lastTurn;                 // 卡住：反向转，避免在死角来回
+                    } else if (l && !r) {
+                        dir = 1;                           // 左压线 → 右转远离
+                    } else if (r && !l) {
+                        dir = 0;                           // 右压线 → 左转远离
+                    } else {
+                        dir = -1;                          // 双侧压线：随机方向
+                    }
+                    Auton_StartEscape(dir,
+                                      heavy ? AUTON_BACK_HEAVY : AUTON_BACK_TICKS,
+                                      heavy ? AUTON_TURN_HEAVY : AUTON_TURN_TICKS);
+                    printf("ZONE l=%d r=%d heavy=%d stuck=%d -> back %d, turn<=%d\r\n",
+                           l, r, heavy, g_stuckCount, g_autoTicks, g_turnTarget);
+                }
+            } else if (dist >= 0.0f && dist < AUTON_SAFE_DIST_CM) {
+                // 前向障碍（软避障）
+                g_lineDeb = 0;
+                car_stop();
+                if (++g_obstDeb >= AUTON_LINE_CONFIRM) {
+                    g_obstDeb = 0;
+                    if (g_recentTrig > 0) g_stuckCount++; else g_stuckCount = 0;
+                    g_recentTrig = AUTON_STUCK_WINDOW;
+                    int dir = (g_stuckCount >= 2) ? !g_lastTurn : -1;
+                    Auton_StartEscape(dir, AUTON_BACK_TICKS, AUTON_TURN_TICKS);
+                    printf("OBST dist=%.1f stuck=%d -> back %d, turn<=%d\r\n",
+                           dist, g_stuckCount, g_autoTicks, g_turnTarget);
+                }
+            } else {
+                g_lineDeb = 0;
+                g_obstDeb = 0;
+                car_forward();   // 安全 → 前进
+            }
+        } else if (g_autoMode == 1) {
+            // ---- BACK：后退脱离危险 ----
+            // 【车尾无传感器保护】倒车降速到 AUTON_BACK_SPEED（默认一半油门）：
+            // 盲退位移减半，车屁股不易整体退出活动区域/撞上身后的边界。
+            stm32_motor_control(-AUTON_BACK_SPEED, -AUTON_BACK_SPEED);
+            if (--g_autoTicks <= 0) {
+                g_autoMode = 2;
+                g_autoTicks = g_turnTarget;   // 转向上限（闭环确认会提前结束）
+            }
+        } else {
+            // ---- TURN：闭环转向 ----
+            // 原实现是"固定转 600ms 就回前进"，转不够会再压回去、反复震荡。
+            // 改为：转够最小时长后持续检测，一旦脱离（不压线且前方无障碍）立即停；
+            // 达到最大转时仍没脱离则强制回 GO，防止传感器异常时原地转不停。
+            if (g_autoTurn) car_right(); else car_left();
+            g_autoTicks--;
+            int turned = g_turnTarget - g_autoTicks;   // 已转向 tick 数
+            if (turned >= AUTON_TURN_MIN && isClear) {
+                g_autoMode = 0;
+                printf("TURN clear after %d ticks\r\n", turned);
+            } else if (g_autoTicks <= 0) {
+                g_autoMode = 0;   // 超时兜底，防卡死
+                printf("TURN timeout(%d ticks), force GO\r\n", g_turnTarget);
+            }
+        }
     }
 }
 
@@ -1274,12 +1569,23 @@ static void I2c_Ssd1306_Demo(void)
 
     // ① 纯 GPIO 外设（不依赖 I2C）
     WS2812_Init();   // 内置 WS2812 灯带（IO06）
+#if ENABLE_SONAR
     HCSR04_Init();   // 超声波 HC-SR04（IO07=TRIG, IO08=ECHO）
+#endif
     TCRT_Init();     // 车底检测 CGQ1/CGQ2（IO13=左，IO14=右，T/R 查询与日志用）
+    {
+        uint8_t tL = 0, tR = 0;
+        TCRT_Read(&tL, &tR);
+        // 极性体检：把车放在浅色地面开机应显示 L=0 R=0；放在黑胶带上应显示 L=1 R=1。
+        // 若浅色地面就显示 1，说明模块极性相反，把 TCRT_ACTIVE_HIGH 改成 0 重编即可。
+        printf("TCRT boot read: L=%d R=%d (1=black/no-reflect)\r\n", tL, tR);
+    }
     printf("=== GPIO init done ===\r\n");
 
     // ② UART 外设
+#if ENABLE_BLE
     BLE_UartInit();      // UART1 蓝牙（IO00/01）
+#endif
     Motor_UartInit();    // UART2 与 STM32 通信（IO11=TXD, IO12=RXD）
     car_stop();          // 上电先发一帧停止指令，避免 STM32 残留状态导致乱跑
     printf("=== UART init done ===\r\n");
@@ -1304,9 +1610,15 @@ static void I2c_Ssd1306_Demo(void)
     SAFE_NEW("thread1", Sensor_ProducerThread);
     SAFE_NEW("thread2", Sensor_ReaderThread);
     SAFE_NEW("thread3", Sensor_DisplayThread);
+#if ENABLE_BLE
     SAFE_NEW("thread4", BLE_RecvThread);
+#endif
     SAFE_NEW("thread5", I2c_InitThread);   // I2C 初始化独立线程
-    SAFE_NEW("thread6", WifiMqttThread);    // WiFi+MQTT 远程控车
+#if ENABLE_WIFI
+    SAFE_NEW("thread6", WifiMqttThread);    // WiFi+MQTT 远程控车（ENABLE_WIFI=1 时）
+#else
+    SAFE_NEW("thread6", AutonomousThread);  // 自主巡逻避障（默认：停 WiFi）
+#endif
 
     printf("=== ALL THREADS STARTED ===\r\n");
 }
