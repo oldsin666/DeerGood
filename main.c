@@ -22,13 +22,15 @@
 #include "wifi_device.h"      // WifiConnect / GetStationIP（见 wifi_connect.c）
 #include "MQTTClient.h"       // paho MQTT 客户端（LiteOS 移植）
 
-#define WIFI_SSID         "BUAA-WIFI"            // 校园网 SSID（北航）
-#define WIFI_PASSWORD     ""                    // BUAA-WIFI 是开放网络，密码留空（OPEN 模式）
-#define MQTT_BROKER_ADDR  "broker.emqx.io"       // 公网 MQTT broker（默认）；需小车所在网络能上外网。BUAA-WIFI 要网页认证→上不了外网，可改用手机热点
-#define MQTT_BROKER_PORT  (1883)                // MQTT 端口
-#define MQTT_CLIENT_ID    "QST_Pioneer_3861"    // 客户端 ID（同一 broker 上需唯一）
-#define MQTT_SUB_TOPIC    "car/control"         // 订阅：手机/电脑往此主题发 W/A/S/D... 控车
-#define MQTT_PUB_TOPIC    "car/status"          // 发布：小车状态上报（可选）
+#define WIFI_SSID         "BUAA-WIFI"            // WiFi 名：改这里（用手机热点就填热点名）
+#define WIFI_PASSWORD     ""                    // WiFi 密码：开放网络留空，有密码填密码
+
+/* ---- 华为云 IoTDA 设备接入三元组（控制台建好设备后，把三个 REPLACE_* 换成真实值）---- */
+#define HW_MQTT_HOST      "REPLACE_HOST.st1.iotda-device.cn-north-4.myhuaweicloud.com" // 接入域名：控制台 IoTDA 实例"总览-接入信息"里复制
+#define HW_MQTT_PORT      (1883)                // 非加密 MQTT 端口（先明文跑通，8883 需 TLS 以后再加）
+#define HW_DEVICE_ID      "REPLACE_DEVICE_ID"   // 设备 ID
+#define HW_DEVICE_SECRET  "REPLACE_DEVICE_SECRET" // 设备密钥（secret）
+#define HW_SERVICE_ID     "CarService"          // 产品模型的服务 ID（必须与平台定义一致）
 
 // ===================== 字模 =====================
 static const unsigned char F6x8[][6] =
@@ -700,7 +702,7 @@ static void stm32_motor_control(int motorA, int motorB)
 // ===================== 自主巡逻（围场避障 + 黑胶带禁区）配置 =====================
 // 上电默认进入自主巡逻：超声波防撞 + TCRT 检测黑胶带禁区边界不越线。
 // 蓝牙运动指令(O/W/A/S/D/I/K)可临时接管（暂停自主 MANUAL_OVERRIDE_TICKS 个 tick），方便手动救车。
-#define ENABLE_WIFI           0       // 1=启动 WiFi/MQTT 任务  0=自主巡逻模式（停 WiFi）
+#define ENABLE_WIFI           1       // 1=启动 WiFi/MQTT 任务（连华为云 IoTDA）；WiFi 连不上只影响 MQTT，自主巡逻不受影响
 #define AUTON_SAFE_DIST_CM   30      // 前向障碍安全距离(cm)，小于此触发后退+转向（实车可调）
 #define AUTON_BACK_TICKS     0       // 单侧压线：不直线倒车！车尾无传感器，盲退易把车屁股送出活动区域；原地转向即可脱离
 #define AUTON_BACK_HEAVY     2       // 双侧同时压线（车头垂直顶线）：最短慢速微退让前轮离线再转向（原3→2）
@@ -714,6 +716,20 @@ static void stm32_motor_control(int motorA, int motorB)
 #define AUTON_LINE_SUBTICK   10      // 黑线子采样间隔(ms)：100ms 决策周期内细分多次采样，防窄胶带被整周期漏掉
 #define AUTON_SUB_LOOP       (AUTON_TICK_MS / AUTON_LINE_SUBTICK)  // 每个决策周期的子采样次数 = 10
 #define AUTON_LINE_HOLD      2       // 连续几次(×10ms=20ms)为高才算真压线，滤掉毛刺干扰导致的误动作
+
+/* ===== 创新点①：传感器健康度评估 + 分级降级自治 =====
+ * 思路：不让"某个传感器坏了"导致整车瘫掉。系统持续评估每个传感器的可信度，
+ *       判定不可信后自动切换到不依赖它的降级行为策略，并在恢复后自动回到完整模式。 */
+#define LINE_EVAL_WINDOW    50      // 健康度评估窗口(tick)：50×100ms = 5 秒统计一次
+#define LINE_STUCK_PCT      80      // 窗口内"压线"占比 ≥80% → 判定巡线传感器失效（恒压线/卡死）
+#define I2C_FAIL_MAX        10      // I2C 连续读失败次数上限，超过判定环境传感器异常
+#define SONAR_FAIL_MAX      20      // 超声连续无有效测距次数上限(20×100ms≈2s)，超过判定超声故障→降级巡航
+#define TIMED_GO_TICKS      30      // 降级模式：直线前进 tick 数（3 秒）
+#define TIMED_TURN_BASE     3       // 降级模式：转向 tick 基数（随机 3~8，避免走出死板的正方形轨迹）
+
+#define PATROL_MODE_FULL    0       // 完整模式：信任巡线 + 前向避障
+#define PATROL_MODE_TIMED   1       // 降级模式：不信任黑线传感器，改用定时转向巡逻兜底
+
 #define AUTON_START_DELAY_S  0       // 开机延迟已关闭：上电即开始巡逻（0=不等待）。如需摆车时间改回 120
 #define AUTON_RUN_TIME_S     120     // 启动后自动巡逻总时长(秒)，到点后永久停车不再动作（2分钟）
 #define MANUAL_OVERRIDE_TICKS 60     // 收蓝牙指令后暂停自主的 tick 数(≈6s)
@@ -976,11 +992,24 @@ static int g_alsValid = 0;   // AP3216C 是否读到有效光照数据
 static uint16_t g_ps = 0;
 static float g_distance = -1.0f;   // 超声波距离(cm)，<0 表示没测到（禁用超声波时恒为 -1）
 #if ENABLE_SONAR
-static volatile int g_sonarReady = 0;  // 1=thread2 已完成首帧测距（自主巡逻据此才开始决策）
+static volatile int g_sonarReady = 0;  // 1=thread2 已完成首帧测距（AutonomousThread 等待此标志后才决策）
+static unsigned int g_sonarFailCnt = 0; // 超声连续无有效测距次数（≥SONAR_FAIL_MAX 判定超声故障→降级巡航）
 #endif
 static int g_ledState = -1;        // 内置 LED 当前状态（见 Led_Update）
 static uint8_t g_leftBlack = 0;    // 1=左车底检测识别到无反射/黑线（IO13，高电平有效）
 static uint8_t g_rightBlack = 0;   // 1=右车底检测识别到无反射/黑线（IO14，高电平有效）
+
+/* ---- 传感器健康度 / 降级自治状态 ---- */
+static int g_lineFault = 0;        // 1=巡线传感器判定失效（窗口内恒压线），不再信任它
+static int g_i2cFault = 0;         // 1=I2C 环境传感器异常（连续读失败）
+static int g_i2cFailCnt = 0;       // I2C 连续读失败计数
+static unsigned int g_evalTicks = 0;    // 健康度评估窗口内的 tick 计数
+static unsigned int g_lineOnTicks = 0;  // 窗口内"压线"的 tick 计数
+static unsigned int g_patrolMode = PATROL_MODE_FULL;  // 当前决策模式（完整 / 降级）
+static unsigned int g_timedTicks = 0;   // 降级模式下的前进计时
+static unsigned int g_lineOnPct = 0;    // 最近一个窗口的压线占比（降级判定输入：≥LINE_STUCK_PCT 即判黑线失效）
+
+// 注：降级与故障判定全部在 AutonomousThread 本地完成，不依赖华为云/WiFi；仅环境传感器(I2C)故障时打印报错日志。
 static osSemaphoreId_t g_semRead = NULL;
 static osSemaphoreId_t g_semDisp = NULL;
 static volatile int g_i2cReady = 0;   // I2C 设备(OLED/SHT20/AP3216C)初始化完成标志
@@ -1029,8 +1058,10 @@ static void Sensor_ReaderThread(void *arg)
             if (SHT20_ReadData(&temp, &humi) == 0) {
                 g_temp = temp;
                 g_humi = humi;
+                if (g_i2cFailCnt > 0) g_i2cFailCnt--;   // 读成功就回落失败计数
             } else {
                 printf("SHT20 read fail\r\n");
+                if (g_i2cFailCnt < I2C_FAIL_MAX * 2) g_i2cFailCnt++;
             }
 
             if (AP3216C_ReadData(&ir, &als, &ps) == 0) {
@@ -1041,6 +1072,16 @@ static void Sensor_ReaderThread(void *arg)
             } else {
                 g_alsValid = 0;
                 printf("AP3216C read fail\r\n");
+                if (g_i2cFailCnt < I2C_FAIL_MAX * 2) g_i2cFailCnt++;
+            }
+
+            // I2C 健康度：连续失败到阈值即判定总线异常（上报云端，而不是拿脏数据继续算）
+            if (g_i2cFailCnt >= I2C_FAIL_MAX) {
+                if (!g_i2cFault) printf("!!! I2C sensor FAULT (fail %d times)\r\n", g_i2cFailCnt);
+                g_i2cFault = 1;
+            } else if (g_i2cFailCnt == 0) {
+                if (g_i2cFault) printf("=== I2C sensor recovered\r\n");
+                g_i2cFault = 0;
             }
         }
 
@@ -1293,33 +1334,83 @@ static void I2c_InitThread(void *arg)
 extern int WifiConnect(const char *ssid, const char *psk);
 extern int GetStationIP(char *ipbuf, int buflen);
 
+// 仅本 WiFi 线程内部使用的链路状态（与自主巡逻/创新解耦，不进设备画像，不上报创新字段）
+
 static MQTTClient g_mqttClient;
 static Network   g_mqttNet;
 static unsigned char g_mqttSendBuf[256];
 static unsigned char g_mqttReadBuf[1024];
 
-// MQTT 收到指令回调：payload 首字符即遥控指令（与蓝牙同一套），复用运动函数
-static void MQTT_MessageArrived(MessageData *data)
+// 执行单字符遥控指令（与蓝牙同一套：W/A/S/D/O/I/K）
+// 自主巡逻线程同时也在跑，收到 MQTT 指令后必须"接管"，否则下一帧就被自主逻辑覆盖掉
+static void Car_ExecCmd(char ch)
 {
-    if (data == NULL || data->message == NULL) return;
-    int len = (int)data->message->payloadlen;
-    char *payload = (char *)data->message->payload;
-    if (len <= 0 || payload == NULL) return;
-
-    printf("MQTT RX on %.*s: %.*s\r\n",
-           data->topicName->lenstring.len, data->topicName->lenstring.data,
-           len, payload);
-
-    char ch = payload[0];
+    g_manualTicks = MANUAL_OVERRIDE_TICKS;   // 接管若干秒（AutonomousThread 每 tick 递减）
+    g_autoMode = 0;                          // 清掉逃跑动作状态，避免残留的转向/后退继续
     switch (ch) {
         case 'O': case 'o': car_stop();                    break;
         case 'W': case 'w': car_forward();                 break;
         case 'S': case 's': car_backward();               break;
         case 'A': case 'a': car_left();                    break;
-        case 'D': case 'd': car_right();                   break;
+        case 'D': case 'd': car_right();                    break;
         case 'I': case 'i': stm32_motor_control(100, 100); break;
         case 'K': case 'k': stm32_motor_control(150, 150); break;
         default: break;   // 其它字符忽略
+    }
+}
+
+// MQTT 收到消息回调：
+//  - 普通主题：payload 首字符即指令（W/A/S/D/O/I/K）
+//  - 华为云命令：payload 为 JSON {"paras":{"value":"W"},...}，提取 value 首字符执行；
+//    命令 topic 形如 $oc/devices/{id}/sys/commands/request_id=xxx，
+//    需回 $oc/devices/{id}/sys/commands/response/request_id=xxx，否则平台显示"命令超时"
+static void MQTT_MessageArrived(MessageData *data)
+{
+    if (data == NULL || data->message == NULL || data->topicName == NULL) return;
+    int len = (int)data->message->payloadlen;
+    char *payload = (char *)data->message->payload;
+    if (len <= 0 || payload == NULL) return;
+
+    char topic[192];
+    int tlen = data->topicName->lenstring.len;
+    if (tlen <= 0 || tlen >= (int)sizeof(topic)) return;
+    memcpy(topic, data->topicName->lenstring.data, (size_t)tlen);
+    topic[tlen] = '\0';
+
+    char pbuf[384];
+    if (len >= (int)sizeof(pbuf)) len = (int)sizeof(pbuf) - 1;
+    memcpy(pbuf, payload, (size_t)len);
+    pbuf[len] = '\0';
+
+    printf("MQTT RX on %s: %s\r\n", topic, pbuf);
+
+    char ch = pbuf[0];
+    if (ch == '{') {
+        // 华为云命令 JSON：找 "value" 之后的第一个引号，引号内即指令字符
+        const char *vp = strstr(pbuf, "\"value\"");
+        if (vp != NULL) {
+            const char *q1 = strchr(vp + 7, '"');
+            if (q1 != NULL && q1[1] != '\0') ch = q1[1];
+        }
+    }
+    Car_ExecCmd(ch);
+
+    // 华为云命令回执（不影响执行，但让平台命令状态显示"成功"而非"超时"）
+    const char *rid = strstr(topic, "request_id=");
+    if (rid != NULL && strstr(topic, "/sys/commands/") != NULL) {
+        char respTopic[224];
+        int prefix = (int)(rid - topic);   // 截到 ".../sys/commands/" 为止
+        snprintf(respTopic, sizeof(respTopic), "%.*sresponse/%s", prefix, topic, rid);
+        char resp[64];
+        int rn = snprintf(resp, sizeof(resp),
+                          "{\"result_code\":0,\"result_msg\":\"ok\"}");
+        MQTTMessage rmsg;
+        rmsg.qos = QOS0;
+        rmsg.retained = 0;
+        rmsg.dup = 0;
+        rmsg.payload = resp;
+        rmsg.payloadlen = rn;
+        MQTTPublish(&g_mqttClient, respTopic, &rmsg);
     }
 }
 
@@ -1330,7 +1421,7 @@ static void WifiMqttThread(void *arg)
 
     printf("=== WiFi+MQTT thread start ===\r\n");
 
-    // 1) 连 WiFi（PSK 方式）
+    // 1) 连 WiFi（wifi_connect.c 自适应 OPEN/PSK：密码空=开放网络）
     if (WifiConnect(WIFI_SSID, WIFI_PASSWORD) != 0) {
         printf("!!! WifiConnect failed, MQTT disabled\r\n");
         return;
@@ -1348,42 +1439,96 @@ static void WifiMqttThread(void *arg)
                    g_mqttSendBuf, sizeof(g_mqttSendBuf),
                    g_mqttReadBuf, sizeof(g_mqttReadBuf));
 
-    // 3) 连接 broker（用局部数组避免字符串字面量传 char* 告警）
-    char broker_addr[64];
-    strncpy(broker_addr, MQTT_BROKER_ADDR, sizeof(broker_addr) - 1);
+    // 3) TCP 连华为云 IoTDA 平台
+    char broker_addr[96];
+    strncpy(broker_addr, HW_MQTT_HOST, sizeof(broker_addr) - 1);
     broker_addr[sizeof(broker_addr) - 1] = '\0';
-    if ((rc = NetworkConnect(&g_mqttNet, broker_addr, MQTT_BROKER_PORT)) != 0) {
-        printf("!!! MQTT NetworkConnect failed: %d\r\n", rc);
+    if ((rc = NetworkConnect(&g_mqttNet, broker_addr, HW_MQTT_PORT)) != 0) {
+        printf("!!! MQTT TCP connect %s:%d failed: %d\r\n",
+               broker_addr, (int)HW_MQTT_PORT, rc);
         return;
     }
 
-    // 启动后台保活/收消息线程（MQTTLiteOS 实现；返回值 0=失败，但不阻塞后续）
-    if (MQTTStartTask(&g_mqttClient) == 0) {
-        printf("WARN MQTTStartTask failed\r\n");
-    }
+    // 4) MQTT 连接鉴权（华为云 IoTDA 规则）：
+    //    ClientID = {device_id}_0_{timestamp}；timestamp=0 表示不校验时间，
+    //    此时 Password 直接用设备密钥（无需 HMAC-SHA256 计算）
+    char client_id[96];
+    char username[64];
+    char password[80];
+    snprintf(client_id, sizeof(client_id), "%s_0_0", HW_DEVICE_ID);
+    snprintf(username, sizeof(username), "%s", HW_DEVICE_ID);
+    snprintf(password, sizeof(password), "%s", HW_DEVICE_SECRET);
 
     MQTTPacket_connectData connectData = MQTTPacket_connectData_initializer;
-    connectData.MQTTVersion = 4;   // 3.1.1
-    char client_id[32];
-    strncpy(client_id, MQTT_CLIENT_ID, sizeof(client_id) - 1);
-    client_id[sizeof(client_id) - 1] = '\0';
+    connectData.MQTTVersion = 4;          // MQTT 3.1.1（华为云支持）
+    connectData.keepAliveInterval = 60;   // 秒；0 会长时间无保活
     connectData.clientID.cstring = client_id;
+    connectData.username.cstring = username;
+    connectData.password.cstring = password;
     if ((rc = MQTTConnect(&g_mqttClient, &connectData)) != 0) {
-        printf("!!! MQTTConnect failed: %d\r\n", rc);
+        printf("!!! MQTTConnect failed: %d (check device id/secret)\r\n", rc);
         return;
     }
-    printf("MQTT connected to %s:%d\r\n", broker_addr, (int)MQTT_BROKER_PORT);
+    printf("MQTT connected to %s:%d (device %s)\r\n", broker_addr, (int)HW_MQTT_PORT, HW_DEVICE_ID);
 
-    // 4) 订阅控制主题
-    if ((rc = MQTTSubscribe(&g_mqttClient, MQTT_SUB_TOPIC, QOS1, MQTT_MessageArrived)) != 0) {
-        printf("!!! MQTTSubscribe failed: %d\r\n", rc);
+    // 5) 订阅平台下行：命令下发 + 消息下发
+    char topic[160];
+    snprintf(topic, sizeof(topic), "$oc/devices/%s/sys/commands/#", HW_DEVICE_ID);
+    if ((rc = MQTTSubscribe(&g_mqttClient, topic, QOS1, MQTT_MessageArrived)) != 0) {
+        printf("!!! MQTTSubscribe commands failed: %d\r\n", rc);
     } else {
-        printf("MQTT subscribed: %s\r\n", MQTT_SUB_TOPIC);
+        printf("MQTT subscribed: %s\r\n", topic);
+    }
+    snprintf(topic, sizeof(topic), "$oc/devices/%s/sys/messages/down", HW_DEVICE_ID);
+    if ((rc = MQTTSubscribe(&g_mqttClient, topic, QOS1, MQTT_MessageArrived)) != 0) {
+        printf("!!! MQTTSubscribe messages failed: %d\r\n", rc);
+    } else {
+        printf("MQTT subscribed: %s\r\n", topic);
     }
 
-    // 5) 后台线程自动维持连接与接收；主循环可在此周期上报状态
+    // 6) 属性上报主题
+    char pubTopic[160];
+    snprintf(pubTopic, sizeof(pubTopic), "$oc/devices/%s/sys/properties/report", HW_DEVICE_ID);
+
+    // 7) 单线程收发循环：MQTTYield 负责保活与接收（消息回调也在此上下文执行，
+    //    避免多线程并发操作同一 MQTTClient）；每 5 秒上报一次传感器属性。
+    int cnt = 0;
     while (1) {
-        osDelay(1000);
+        MQTTYield(&g_mqttClient, 500);
+        if (++cnt >= 10) {
+            cnt = 0;
+
+            // 华为云仅上报「物理传感器遥测」（温湿度/光照/距离/黑线），降级与故障判定在本地完成，不在此产生额外日志。
+            // 【自查修复】Hi3861 的 printf/snprintf 默认不编译浮点格式(%f)（见 thread2 注释），
+            // 原上报用 %.2f/%.1f，连上云后 JSON 会乱码被拒收。改为整数放大拼小数，永远合法。
+            int ti = (int)(g_temp * 100.0f);
+            int hi = (int)(g_humi * 100.0f);
+            int di = (int)((g_distance < 0.0f ? -1.0f : g_distance) * 10.0f);
+            char payload[256];
+            int n = snprintf(payload, sizeof(payload),
+                "{\"services\":[{\"service_id\":\"%s\",\"properties\":{"
+                "\"temperature\":%d.%02d,\"humidity\":%d.%02d,\"light\":%u,"
+                "\"distance\":%d.%01d,\"left_black\":%u,\"right_black\":%u}}]}",
+                HW_SERVICE_ID,
+                ti / 100, (ti < 0 ? -(ti % 100) : ti % 100),
+                hi / 100, (hi < 0 ? -(hi % 100) : hi % 100),
+                (unsigned)g_als,
+                di / 10, (di < 0 ? -(di % 10) : di % 10),
+                (unsigned)g_leftBlack, (unsigned)g_rightBlack);
+            if (n > 0 && n < (int)sizeof(payload)) {
+                MQTTMessage msg;
+                msg.qos = QOS1;
+                msg.retained = 0;
+                msg.dup = 0;
+                msg.payload = payload;
+                msg.payloadlen = n;
+                if ((rc = MQTTPublish(&g_mqttClient, pubTopic, &msg)) != 0) {
+                    printf("!!! MQTT publish failed: %d\r\n", rc);
+                } else {
+                    printf("MQTT report: %s\r\n", payload);
+                }
+            }
+        }
     }
 }
 
@@ -1396,7 +1541,6 @@ static void WifiMqttThread(void *arg)
 static void AutonomousThread(void *arg)
 {
     (void)arg;
-    printf("=== Autonomous patrol thread start ===\r\n");
     g_autoMode = 0;
     g_autoTicks = 0;
 
@@ -1405,18 +1549,12 @@ static void AutonomousThread(void *arg)
     // 分段延时：单次 osDelay 参数有上限，不能一次 osDelay(120000)。
     // 恢复蓝牙后，这期间收到运动指令会立即结束等待开始巡逻，不用干等。
     car_stop();
-    printf("=== patrol holds %d s before start ===\r\n", AUTON_START_DELAY_S);
     for (int s = 0; s < AUTON_START_DELAY_S; s++) {
         osDelay(1000);                      // 1 秒（tick=1ms）
         if (g_manualTicks > 0) {
-            printf("=== manual cmd during hold, start now ===\r\n");
             break;
         }
-        if ((s + 1) % 10 == 0) {
-            printf("start in %d s\r\n", AUTON_START_DELAY_S - s - 1);
-        }
     }
-    printf("=== hold done, patrol GO ===\r\n");
 
     g_autoT0 = (uint32_t)hi_get_us();   // 记录巡逻启动时刻，用于"运行 AUTON_RUN_TIME_S 秒后停车"
 
@@ -1455,7 +1593,6 @@ static void AutonomousThread(void *arg)
             ((uint32_t)hi_get_us() - g_autoT0) >= (AUTON_RUN_TIME_S * 1000000UL)) {
             g_autoStopped = 1;
             car_stop();
-            printf("=== patrol auto-stop after %d s ===\r\n", AUTON_RUN_TIME_S);
         }
         if (g_autoStopped) {
             car_stop();        // 持续保持停车，不再做任何决策
@@ -1476,7 +1613,62 @@ static void AutonomousThread(void *arg)
         uint8_t r = rLatch;
         float dist = g_distance;   // cm, <0 表示无回波/超时
 
+        // 【创新点① 传感器健康度评估】滑动窗口统计"压线占比"：
+        // 正常的车在场地里跑，只会偶尔压到边界线；若一个窗口内几乎全程压线，
+        // 说明传感器卡死/阈值失效（例如 IO 悬空被上拉成常高），此时它的读数不可信。
+        g_evalTicks++;
+        if (l || r) g_lineOnTicks++;
+        if (g_evalTicks >= LINE_EVAL_WINDOW) {
+            g_lineOnPct = (unsigned int)g_lineOnTicks * 100U / g_evalTicks;
+            g_lineFault = (g_lineOnPct >= LINE_STUCK_PCT) ? 1 : 0;
+            g_evalTicks = 0;
+            g_lineOnTicks = 0;
+
+        }
+
+        // 【分级降级】黑线或超声波任一故障 → 切到不依赖它的定时转向巡航兜底。
+        int sonarBad = 0;
+#if ENABLE_SONAR
+        // 超声故障判定：已就绪(g_sonarReady)但距离持续无效(dist<0，模块故障/脱落/被遮挡) → 降级。
+        // 【自查修复】不能用 !g_sonarReady：它首帧测距后恒为 1，检测不到"运行中"的超声故障，
+        // 会导致"超声故障→自动转向巡航"这条功能在 ENABLE_SONAR=1 时失效。
+        if (g_sonarReady && g_distance < 0.0f) {
+            if (g_sonarFailCnt < 0xFFFFFFFFu) g_sonarFailCnt++;
+        } else {
+            g_sonarFailCnt = 0;
+        }
+        sonarBad = (g_sonarFailCnt >= SONAR_FAIL_MAX) ? 1 : 0;
+#endif
+        unsigned int wantMode = (g_lineFault || (unsigned)sonarBad) ? PATROL_MODE_TIMED : PATROL_MODE_FULL;
+        if (wantMode != g_patrolMode) {
+            g_patrolMode = wantMode;
+            car_stop();
+            g_autoMode = 0;
+            g_timedTicks = 0;
+        }
+
         if (g_recentTrig > 0) g_recentTrig--;   // 卡顿判定窗口倒计时
+
+        // ---- 降级模式：不信任黑线传感器，用"前进 N 秒 → 随机转向"兜底巡逻 ----
+        // 这样即使巡线传感器整路失效，车也不会原地抽搐或一直顶着墙，仍能覆盖场地并持续上报数据。
+        if (g_patrolMode == PATROL_MODE_TIMED) {
+            if (g_autoMode == 0) {
+                car_forward();
+                if (++g_timedTicks >= TIMED_GO_TICKS) {
+                    g_timedTicks = 0;
+                    g_autoMode = 2;   // 进入转向
+                    g_autoTicks = TIMED_TURN_BASE + (unsigned)(my_rand() % 6);   // 3~8 tick 随机
+                    g_autoTurn = (int)(my_rand() & 1u);
+                }
+            } else {
+                if (g_autoTurn) car_right(); else car_left();
+                if (--g_autoTicks <= 0) {
+                    g_autoMode = 0;
+                    g_timedTicks = 0;
+                }
+            }
+            continue;   // 降级模式不参与下面的黑线决策（数据已被判定不可信）
+        }
 
         // 统一安全判据：不压黑线 且 前方无障碍（两种触发共用，脱离判定更严谨）
         int isClear = !(l || r) && !(dist >= 0.0f && dist < AUTON_SAFE_DIST_CM);
@@ -1506,8 +1698,6 @@ static void AutonomousThread(void *arg)
                     Auton_StartEscape(dir,
                                       heavy ? AUTON_BACK_HEAVY : AUTON_BACK_TICKS,
                                       heavy ? AUTON_TURN_HEAVY : AUTON_TURN_TICKS);
-                    printf("ZONE l=%d r=%d heavy=%d stuck=%d -> back %d, turn<=%d\r\n",
-                           l, r, heavy, g_stuckCount, g_autoTicks, g_turnTarget);
                 }
             } else if (dist >= 0.0f && dist < AUTON_SAFE_DIST_CM) {
                 // 前向障碍（软避障）
@@ -1519,8 +1709,6 @@ static void AutonomousThread(void *arg)
                     g_recentTrig = AUTON_STUCK_WINDOW;
                     int dir = (g_stuckCount >= 2) ? !g_lastTurn : -1;
                     Auton_StartEscape(dir, AUTON_BACK_TICKS, AUTON_TURN_TICKS);
-                    printf("OBST dist=%.1f stuck=%d -> back %d, turn<=%d\r\n",
-                           dist, g_stuckCount, g_autoTicks, g_turnTarget);
                 }
             } else {
                 g_lineDeb = 0;
@@ -1546,10 +1734,8 @@ static void AutonomousThread(void *arg)
             int turned = g_turnTarget - g_autoTicks;   // 已转向 tick 数
             if (turned >= AUTON_TURN_MIN && isClear) {
                 g_autoMode = 0;
-                printf("TURN clear after %d ticks\r\n", turned);
             } else if (g_autoTicks <= 0) {
                 g_autoMode = 0;   // 超时兜底，防卡死
-                printf("TURN timeout(%d ticks), force GO\r\n", g_turnTarget);
             }
         }
     }
@@ -1615,10 +1801,10 @@ static void I2c_Ssd1306_Demo(void)
 #endif
     SAFE_NEW("thread5", I2c_InitThread);   // I2C 初始化独立线程
 #if ENABLE_WIFI
-    SAFE_NEW("thread6", WifiMqttThread);    // WiFi+MQTT 远程控车（ENABLE_WIFI=1 时）
-#else
-    SAFE_NEW("thread6", AutonomousThread);  // 自主巡逻避障（默认：停 WiFi）
+    SAFE_NEW("thread6", WifiMqttThread);    // WiFi + 华为云 IoTDA MQTT（属性上报 / 命令下发）
 #endif
+    SAFE_NEW("thread7", AutonomousThread);  // 自主巡逻（与 WiFi/MQTT 并行，互不阻塞；
+                                            //  MQTT 下发命令时通过 g_manualTicks 短暂接管）
 
     printf("=== ALL THREADS STARTED ===\r\n");
 }
