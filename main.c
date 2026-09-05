@@ -21,9 +21,10 @@
 /* ===== WiFi / MQTT 配置（烧录前改成自己的值）===== */
 #include "wifi_device.h"      // WifiConnect / GetStationIP（见 wifi_connect.c）
 #include "MQTTClient.h"       // paho MQTT 客户端（LiteOS 移植）
+#include "line_patrol.h"      // 黑线循迹巡航线程（Y 路口随机选路 / 干型终点停车 / 死路掉头）
 
-#define WIFI_SSID         "BUAA-WIFI"            // WiFi 名：改这里（用手机热点就填热点名）
-#define WIFI_PASSWORD     ""                    // WiFi 密码：开放网络留空，有密码填密码
+#define WIFI_SSID         "QST-WIFI"            // WiFi 名：教程默认 QST-WIFI（实际连网时改成你的热点）
+#define WIFI_PASSWORD     "qst654321"           // WiFi 密码：教程默认 PSK 密码
 
 /* ---- 华为云 IoTDA 设备接入三元组（控制台建好设备后，把三个 REPLACE_* 换成真实值）---- */
 #define HW_MQTT_HOST      "REPLACE_HOST.st1.iotda-device.cn-north-4.myhuaweicloud.com" // 接入域名：控制台 IoTDA 实例"总览-接入信息"里复制
@@ -569,10 +570,18 @@ uint32_t AP3216C_Init(void)
     return 0;
 }
 
+/* 巡逻模式选择（两个线程都控车，只能二选一）：
+ *   1 = 黑线循迹巡航（line_patrol.c）：沿黑胶带走、压白修正、Y 路口随机选一条、
+ *       3 秒内再次遇到 Y = 干字型路口 = 终点自动停车、黑白都检测不到 = 死路原地掉头
+ *   0 = 原围场避障（AutonomousThread）：黑禁区 + 超声避障 + 传感器故障降级巡航
+ */
+#define PATROL_MODE_SELECT 1
+
 // ===================== UART1 蓝牙（BLE / JDY-16） =====================
-// 【暂时屏蔽蓝牙】ENABLE_BLE=0 时不初始化 UART1、不创建接收线程、不解析指令，仅自主巡逻。
-// 要恢复蓝牙遥控时把下面宏改成 1 重编即可。
-#define ENABLE_BLE 0
+// 【2026-09-05 解封】ENABLE_BLE=1：初始化 UART1(IO00/01)、创建 BLE_RecvThread、解析 W/A/S/D/O/I/K 指令；
+// 手机/电脑连 JDY-16 发指令后，经 g_manualTicks 短时接管自主巡逻（上电先按 115200 试，收不到再扫其它波特率）。
+// 要重新屏蔽时把下面宏改回 0 重编即可。
+#define ENABLE_BLE 1
 // 硬件：IO00=UART1_TXD, IO01=UART1_RXD（连 JDY-16 蓝牙模块）
 // 【波特率自适应】JDY-16 出厂波特率不唯一（常见 9600，也有 115200），而系统 peripheral_init()
 //   默认把 UART1 配成 115200（用于 AT/调试）。若模块波特率与 UART1 不一致，收到的数据全是乱码，
@@ -724,6 +733,7 @@ static void stm32_motor_control(int motorA, int motorB)
 #define LINE_STUCK_PCT      80      // 窗口内"压线"占比 ≥80% → 判定巡线传感器失效（恒压线/卡死）
 #define I2C_FAIL_MAX        10      // I2C 连续读失败次数上限，超过判定环境传感器异常
 #define SONAR_FAIL_MAX      20      // 超声连续无有效测距次数上限(20×100ms≈2s)，超过判定超声故障→降级巡航
+#define SONAR_MIN_VALID_CM  2       // 超声有效读数下限(cm)：低于此值一律视为无效读数（无回波<0 / 超时 / 模块故障恒返回0）
 #define TIMED_GO_TICKS      30      // 降级模式：直线前进 tick 数（3 秒）
 #define TIMED_TURN_BASE     3       // 降级模式：转向 tick 基数（随机 3~8，避免走出死板的正方形轨迹）
 
@@ -865,10 +875,13 @@ static void WS2812_Init(void)
 }
 
 // ===================== HC-SR04 超声波（IO07=TRIG, IO08=ECHO） =====================
-// 【临时禁用超声波】模块故障，恒返回 0 —— 但避障判据是 (dist >= 0 && dist < 安全距离)，
-// 0 会被当成"紧贴障碍"，导致小车不停后退转向、根本无法前进。故整段禁用，仅测黑胶带禁区。
-// 超声波修好后，把下面宏改回 1 即可恢复（驱动/初始化/上电等待逻辑会一并重新编入）。
-#define ENABLE_SONAR 0
+// 【2026-09-05 解封】ENABLE_SONAR=1：驱动/初始化/上电等待首帧/故障判定逻辑全部重新编入。
+// ⚠️ 该模块此前故障表现为"恒返回 0"，而避障判据是 (dist >= 0 && dist < 安全距离)，
+//    0 会被当成"紧贴障碍"，导致车不停后退转向、无法前进 —— 这正是当初整段禁用的原因。
+// 【配套修复】故障判定已扩展：低于有效读数下限 SONAR_MIN_VALID_CM 的读数一律视为无效，
+//   连续 SONAR_FAIL_MAX 次即判定超声故障 → 自动切降级定时巡航（见 AutonomousThread）。
+//   于是：模块正常→正常避障；模块故障→自动降级巡航，车仍能正常巡逻，不会原地抽搐。
+#define ENABLE_SONAR 1
 
 #if ENABLE_SONAR
 #define HC_TRIG  WIFI_IOT_IO_NAME_GPIO_7
@@ -916,6 +929,46 @@ static float HCSR04_GetDistance(void)
     return (float)((double)(t1 - t0) * 0.034 / 2.0);
 }
 #endif  // ENABLE_SONAR
+
+// ===================== SG90 舵机（IO02，板载 JP7 三脚插座） =====================
+// 【2026-09-05 补齐】此前全工程无任何舵机/PWM 代码，现从 13.0_Car_Autonomous_Avoidance
+//   （car_config.h + car_sensor.c）移植并适配本工程命名风格。
+// 原理：SG90 用 50Hz PWM（周期 20ms）控制角度，由高电平宽度决定转角：
+//       500us=正右 90°、1500us=正前 0°、2500us=正左 90°。
+// 实现：**软件模拟 PWM**（GPIO 翻转 + hi_udelay），不占用硬件 PWM 外设，
+//       所以不需要 wifiiot_pwm.h —— 这也是原工程搜不到 PwmInit 的原因。
+// 用途：带动超声波探头左右扫描，实现"左前/正前/右前"三方向扇区避障（比只测正前方可靠得多）。
+// ⚠️ 注意：SG90 个体差异大，500/1500/2500us 是 v13 的实测值，换模块需**实车重新标定**。
+#define SG90_PIN              WIFI_IOT_IO_NAME_GPIO_2
+#define SERVO_DUTY_LEFT       2500U   // 正左方 90°
+#define SERVO_DUTY_FRONT      1500U   // 正前方 0°
+#define SERVO_DUTY_RIGHT      500U    // 正右方 90°
+#define SERVO_PULSES_PER_MOVE 3U      // 每个动作发 3 个脉冲，保证 90° 大角度旋转到位
+
+static void SG90_SetPosition(unsigned int duty_us, unsigned int pulse_count)
+{
+    for (unsigned int i = 0U; i < pulse_count; i++) {
+        GpioSetOutputVal(SG90_PIN, WIFI_IOT_GPIO_VALUE1);
+        hi_udelay(duty_us);
+        GpioSetOutputVal(SG90_PIN, WIFI_IOT_GPIO_VALUE0);
+        hi_udelay(20000U - duty_us);          // 补齐 20ms 周期（50Hz）
+    }
+}
+
+static void SG90_Init(void)
+{
+    IoSetFunc(SG90_PIN, WIFI_IOT_IO_FUNC_GPIO_2_GPIO);
+    GpioSetDir(SG90_PIN, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(SG90_PIN, WIFI_IOT_GPIO_VALUE0);
+    SG90_SetPosition(SERVO_DUTY_FRONT, 8U);   // 上电归中（多发脉冲确保到位）
+    printf("=== SG90 servo init done (front) ===\r\n");
+}
+
+// 三位置封装：后续接入扇区避障时直接调用（需超声模块可用才有意义）。
+// 加 __attribute__((unused))：工程开了 -Werror，未被调用的 static 函数会触发 -Wunused-function 编译失败。
+__attribute__((unused)) static void SG90_TurnLeft(void)  { SG90_SetPosition(SERVO_DUTY_LEFT,  SERVO_PULSES_PER_MOVE); }
+__attribute__((unused)) static void SG90_TurnFront(void) { SG90_SetPosition(SERVO_DUTY_FRONT, SERVO_PULSES_PER_MOVE); }
+__attribute__((unused)) static void SG90_TurnRight(void) { SG90_SetPosition(SERVO_DUTY_RIGHT, SERVO_PULSES_PER_MOVE); }
 
 // ===================== TCRT5000 车底检测（CGQ1=IO13, CGQ2=IO14） =====================
 // 原理图：CGQ1/CGQ2 是两个 TCRT5000 红外对管（车底），经 LM393 U22 比较器输出 TC_OUT_L/R -> IO13/IO14。
@@ -1538,7 +1591,9 @@ static void WifiMqttThread(void *arg)
 // 策略：黑胶带禁区(硬约束) > 前向障碍(软避障)。
 // 每 AUTON_TICK_MS 决策一次：安全则前进；压黑线则后退脱离再朝远离方向转；
 // 前方障碍则后退再随机方向转。脱离完成后回到前进，重新决策。
-static void AutonomousThread(void *arg)
+// 加 __attribute__((unused))：PATROL_MODE_SELECT=1 时本线程不被创建，
+// 而工程开了 -Werror，未被引用的 static 函数会触发 -Wunused-function 编译失败。
+__attribute__((unused)) static void AutonomousThread(void *arg)
 {
     (void)arg;
     g_autoMode = 0;
@@ -1629,10 +1684,13 @@ static void AutonomousThread(void *arg)
         // 【分级降级】黑线或超声波任一故障 → 切到不依赖它的定时转向巡航兜底。
         int sonarBad = 0;
 #if ENABLE_SONAR
-        // 超声故障判定：已就绪(g_sonarReady)但距离持续无效(dist<0，模块故障/脱落/被遮挡) → 降级。
-        // 【自查修复】不能用 !g_sonarReady：它首帧测距后恒为 1，检测不到"运行中"的超声故障，
-        // 会导致"超声故障→自动转向巡航"这条功能在 ENABLE_SONAR=1 时失效。
-        if (g_sonarReady && g_distance < 0.0f) {
+        // 超声故障判定：已就绪(g_sonarReady)但读数持续无效 → 降级。无效 = 无回波(<0) 或 低于有效下限。
+        // 【自查修复①】不能用 !g_sonarReady：它首帧测距后恒为 1，检测不到"运行中"的超声故障。
+        // 【自查修复②】本模块故障表现为"恒返回 0"，而 0 会被避障判据当成"紧贴障碍"使车原地抽搐，
+        //   只判 dist<0 抓不到它。故把"低于 SONAR_MIN_VALID_CM"也计入无效读数：
+        //   真实贴墙时车会后退、距离随即变大、计数清零，不会误判；
+        //   只有读数恒定不变的坏模块才会持续累计到 SONAR_FAIL_MAX 从而降级（车改为定时巡航，仍能跑）。
+        if (g_sonarReady && g_distance < (float)SONAR_MIN_VALID_CM) {
             if (g_sonarFailCnt < 0xFFFFFFFFu) g_sonarFailCnt++;
         } else {
             g_sonarFailCnt = 0;
@@ -1755,6 +1813,7 @@ static void I2c_Ssd1306_Demo(void)
 
     // ① 纯 GPIO 外设（不依赖 I2C）
     WS2812_Init();   // 内置 WS2812 灯带（IO06）
+    SG90_Init();     // SG90 舵机（IO02）：上电归中，为超声扇区扫描预留（当前未接入避障）
 #if ENABLE_SONAR
     HCSR04_Init();   // 超声波 HC-SR04（IO07=TRIG, IO08=ECHO）
 #endif
@@ -1803,8 +1862,12 @@ static void I2c_Ssd1306_Demo(void)
 #if ENABLE_WIFI
     SAFE_NEW("thread6", WifiMqttThread);    // WiFi + 华为云 IoTDA MQTT（属性上报 / 命令下发）
 #endif
+#if PATROL_MODE_SELECT
+    SAFE_NEW("thread7", LinePatrol_Thread);  // 黑线循迹巡航（Y 路口 / 干型终点 / 死路掉头）
+#else
     SAFE_NEW("thread7", AutonomousThread);  // 自主巡逻（与 WiFi/MQTT 并行，互不阻塞；
                                             //  MQTT 下发命令时通过 g_manualTicks 短暂接管）
+#endif
 
     printf("=== ALL THREADS STARTED ===\r\n");
 }
